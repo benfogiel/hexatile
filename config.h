@@ -57,8 +57,20 @@
 // Protocol tuning
 // ============================================================================
 #define COMMS_BAUD         9600UL
-#define BEACON_MS          400      // per-side beacon interval
-#define NEIGHBOR_TIMEOUT_MS 1500    // side considered vacated after this
+#define BEACON_MS          400      // beacon interval on a side that has a neighbor
+
+// Beacon interval on a side that has none. Transmitting masks every side's pin
+// interrupt for the whole 13 ms packet, so a beacon into an open edge is 13 ms
+// of deafness on the edges that are actually mated — and on a small assembly
+// most edges are open, which makes that the single largest source of loss on
+// the links that matter. Open sides only have to beacon often enough to notice
+// a tile being attached, so they back off to discovery duty.
+#define IDLE_BEACON_MS     1600
+
+// Side considered vacated after this. It has to cover a burst of loss, not just
+// one packet: at BEACON_MS this is the number of consecutive misses that will
+// drop a live neighbor and send the tile back to believing it is a root.
+#define NEIGHBOR_TIMEOUT_MS 3000
 #define AIR_DELAY_MS       13       // airtime of one 12-byte packet (for time sync)
 #define ANIM_PERIOD_MS     20000U   // root cycles animation every 20 s (must be < 65535)
 #define NUM_ANIMS          3

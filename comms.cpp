@@ -251,15 +251,23 @@ void comms_poll() {
     // so the caller's interrupt state is restored, not blindly enabled; its
     // memory barriers are also what keep the compiler from caching nbr[] across
     // the section.
+    bool present;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       if (nbr[s].present && (uint16_t)(now - nbr[s].lastHeard) > NEIGHBOR_TIMEOUT_MS)
         nbr[s].present = false;
+      present = nbr[s].present;
     }
 
-    // Beacon when due, with ID/side-dependent jitter to break collision lockstep
+    // Beacon when due, with ID/side-dependent jitter to break collision lockstep.
+    // A side with nothing on it backs off: sending masks every side's interrupt
+    // for the whole packet, so beaconing into an open edge buys nothing and
+    // costs 13 ms of deafness on the edges that are mated. On a two-tile
+    // assembly that is five sixths of all the deafness a tile inflicts on
+    // itself, and it lands squarely on the only link there is.
     if ((int16_t)(now - nextBeacon[s]) >= 0) {
       send_beacon(s);
-      nextBeacon[s] = now + BEACON_MS + ((gID * 13u + s * 29u + now) & 0x3F);
+      nextBeacon[s] = now + (present ? BEACON_MS : IDLE_BEACON_MS)
+                    + ((gID * 13u + s * 29u + now) & 0x3F);
     }
   }
 }

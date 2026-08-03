@@ -27,8 +27,15 @@ its own 91 LEDs locally. The single-wire links only carry tiny, infrequent
 
 `[A5][ver][rootID][q][r][rot<<3|txSide][hop][age][t_lo][t_hi][animID][crc8]`
 
-* Each side beacons every ~400 ms (jittered). Lines idle high on internal
-  pull-ups; a falling edge triggers a per-byte RX interrupt (~1.1 ms each).
+* A side with a neighbor beacons every ~400 ms (jittered); an open side backs
+  off to `IDLE_BEACON_MS`. Transmitting masks *every* side's interrupt for the
+  whole 13 ms packet, so a beacon into an open edge is 13 ms of deafness on the
+  edges that are mated, bought for nothing. On two tiles that was five sixths of
+  all self-inflicted deafness, landing on the only link in the assembly: 32% of
+  it lost, enough to time out a live neighbor and send the follower back to
+  believing it is a root. Open sides only need to notice a tile being attached.
+* Lines idle high on internal pull-ups; a falling edge triggers a per-byte RX
+  interrupt (~1.1 ms each).
 * Collisions/corruption are expected and cheap: CRC drops the packet, the
   next beacon retries. `strip.show()` also masks interrupts for ~2.7 ms;
   bytes lost there are recovered the same way.
@@ -113,8 +120,15 @@ and still render its own contents rotated against its physical sides, which
 tears every seam while each tile looks individually fine. Against the code that
 ignored `LED_THETA0_HALF_STEPS`, this check fails at 23.8 mm.
 
+The wire model includes self-deafness: a tile that is transmitting on any side
+receives nothing on any side for the duration, so beacon scheduling shows up in
+delivery rates. A two-tile scenario reports what fraction of the single link
+survives, and fails if the follower ever falls back to believing it is a root —
+which at `IDLE_BEACON_MS 400` / `NEIGHBOR_TIMEOUT_MS 1500` it did for 2150 ms
+out of every 60 s, matching what the hardware showed.
+
 Covered: cold start, root unplugged mid-ring, a tile moved to a new cell and
-rotation, and 20% packet loss. The root-removal case is the one that motivated
+rotation, 20% packet loss, and a two-tile pair with ±1% oscillators. The root-removal case is the one that motivated
 the age byte in the beacon: against the pre-aging code it never recovers at
 all, and the test does fail there, so it is not scoring vacuously.
 

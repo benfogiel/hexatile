@@ -86,6 +86,13 @@ static uint16_t nextBeacon[NTILE][NUM_SIDES];
 static uint32_t trueMs;
 static int      lossPercent;
 
+// Transmitting masks every side's pin interrupt for the whole packet, so a tile
+// is deaf on all six sides while it beacons on any one of them. That is the
+// dominant loss on a lightly populated assembly: the beacons a tile sends into
+// its OPEN edges are pure self-inflicted deafness on the edge that is mated.
+static uint32_t deafUntil[NTILE];
+static int      pktSent, pktLostDeaf, pktDelivered;
+
 static void enter(int t) {
   g_tile   = t;
   g_now_ms = skew[t] + (uint32_t)(trueMs * rate[t]);
@@ -140,15 +147,17 @@ static void tile_comms(int t) {
     if ((int16_t)(now - nextBeacon[t][s]) >= 0) {
       NodeInfo info;
       API_TBL[t].fill(&info, s);
+      deafUntil[t] = trueMs + AIR_DELAY_MS;    // sending blinds every side
       int back, u = mate_of(t, s, &back);
       if (u >= 0 && qn < 256 && (rand() % 100) >= lossPercent) {
+        pktSent++;
         queue[qn].dueMs   = trueMs + AIR_DELAY_MS;
         queue[qn].dst     = u;
         queue[qn].dstSide = (uint8_t)back;
         queue[qn].info    = info;
         qn++;
       }
-      nextBeacon[t][s] = now + BEACON_MS
+      nextBeacon[t][s] = now + (g_nbr[t][s].present ? BEACON_MS : IDLE_BEACON_MS)
                        + ((API_TBL[t].id() * 13u + s * 29u + now) & 0x3F);
     }
   }
@@ -158,11 +167,18 @@ static void deliver_due() {
   for (int i = 0; i < qn; ) {
     if (queue[i].dueMs > trueMs) { i++; continue; }
     int d = queue[i].dst;
-    if (truth[d].present) {
+    // Receiving needs the whole packet: if the destination was transmitting at
+    // any point while this one was in the air, it missed bytes and the CRC
+    // drops it.
+    bool deaf = deafUntil[d] > queue[i].dueMs - AIR_DELAY_MS;
+    if (truth[d].present && !deaf) {
+      pktDelivered++;
       enter(d);
       g_nbr[d][queue[i].dstSide].info      = queue[i].info;
       g_nbr[d][queue[i].dstSide].lastHeard = (uint16_t)g_now_ms;
       g_nbr[d][queue[i].dstSide].present   = true;
+    } else if (truth[d].present) {
+      pktLostDeaf++;
     }
     queue[i] = queue[--qn];
   }
@@ -336,6 +352,36 @@ static void build_flower() {
   for (int t = 0; t < NTILE; t++) set_id(t, IDS[t]);
 }
 
+// Two tiles on a bench: one mated edge each, ten open ones between them. The
+// interesting number here is not convergence but how much of the only link that
+// exists survives the deafness both tiles inflict on themselves.
+static void build_pair() {
+  static const uint8_t IDS[2] = { 40, 90 };
+  for (int t = 0; t < NTILE; t++) truth[t].present = false;
+  truth[0] = { 0, 0, 0, true };
+  truth[1] = { 1, 0, 4, true };
+  qn = 0; trueMs = 0;
+  pktSent = pktLostDeaf = pktDelivered = 0;
+  for (int t = 0; t < NTILE; t++) { rate[t] = 1.0; skew[t] = 0; deafUntil[t] = 0; }
+  rate[0] = 0.99; rate[1] = 1.01;         // +/-1%, a realistic pair of internal oscillators
+  skew[1] = 5000;
+  for (int t = 0; t < 2; t++) set_id(t, IDS[t]);
+}
+
+// How long the follower can go believing it is a root again, which is what a
+// dropped neighbor looks like on the tile: centre goes white, rotation resets.
+static int worst_gap_ms() {
+  int worst = 0, gap = 0;
+  for (int k = 0; k < 60000; k++) {
+    run_ms(1);
+    enter(1);
+    NodeInfo v; API_TBL[1].fill(&v, 0);
+    if (v.hop == 0) { if (++gap > worst) worst = gap; }
+    else gap = 0;
+  }
+  return worst;
+}
+
 int main() {
   srand(1);
 
@@ -360,6 +406,18 @@ int main() {
   lossPercent = 20;
   build_flower();
   expect_within("cold start converges", 20);
+
+  printf("\n2 tiles, 1 mated edge each, +/-1%% oscillators\n");
+  lossPercent = 0;
+  build_pair();
+  expect_within("pair converges", 10);
+  int dropped = worst_gap_ms();
+  printf("  ....  link %d/%d delivered (%.0f%% lost to self-deafness)\n",
+         pktDelivered, pktSent,
+         pktSent ? 100.0 * pktLostDeaf / pktSent : 0.0);
+  printf("  %s  follower held the root for %d ms over 60 s\n",
+         dropped ? "!!  " : "PASS", dropped);
+  if (dropped) failures++;
 
   printf("\n%s\n\n", failures ? "FAILED" : "all checks passed");
   return failures ? 1 : 0;
