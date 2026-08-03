@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "config.h"
 #include "comms.h"
@@ -58,9 +59,14 @@ struct TileApi {
   void     (*fill)(NodeInfo*, uint8_t);
   uint8_t  (*id)();
   uint16_t (*clock)();
+  int16_t  (*tileX)();
+  int16_t  (*tileY)();
+  const int8_t* (*ledX)();
+  const int8_t* (*ledY)();
 };
 #define API(N) { N::topo_init, N::topo_update, N::topo_fill_beacon, \
-                 N::topo_my_id, N::topo_anim_time }
+                 N::topo_my_id, N::topo_anim_time, \
+                 N::topo_tile_x, N::topo_tile_y, N::topo_led_gx, N::topo_led_gy }
 static const TileApi API_TBL[NTILE] = {
   API(T0), API(T1), API(T2), API(T3), API(T4), API(T5), API(T6)
 };
@@ -178,7 +184,34 @@ static void run_ms(uint32_t ms) {
 // ---------------------------------------------------------------------------
 #define MAX_CLOCK_SPREAD_MS 60
 
+// Where the renderer may put an LED versus where it physically is, once the
+// whole assembly is put through its one shared transform. The budget is integer
+// rounding only: the >>7 fixed-point rotation truncates, and 127/111 stand in
+// for 128 cos 0 / 128 cos 30.
+#define MAX_LED_ERR_MM 2.5
+
 static void rot60(int* q, int* r) { int nq = -*r, nr = *q + *r; *q = nq; *r = nr; }
+
+static void rot_deg(double* x, double* y, double deg) {
+  double c = cos(deg * M_PI / 180.0), s = sin(deg * M_PI / 180.0);
+  double nx = *x * c - *y * s;
+  *y = *x * s + *y * c;
+  *x = nx;
+}
+
+// Physical truth for one LED: tile centre from the axial cell, plus the LED's
+// own table entry turned to the tile's real orientation. The table's theta = 0
+// is LED_THETA0_HALF_STEPS half-sides away from side 0's normal, and side 0's
+// normal physically points along the tile's rotation — that offset is the whole
+// subject of the check below.
+static void led_truth(int t, int i, int qOrigin, int rOrigin, double* x, double* y) {
+  *x = (double)(int8_t)pgm_read_byte(&LED_X[i]);
+  *y = (double)(int8_t)pgm_read_byte(&LED_Y[i]);
+  rot_deg(x, y, 60.0 * (truth[t].rot % 6) + 30.0 * LED_THETA0_HALF_STEPS);
+  int dq = truth[t].q - qOrigin, dr = truth[t].r - rOrigin;
+  *x += (2.0 * dq + dr) * TILE_PITCH_MM / 2.0;
+  *y += dr * TILE_PITCH_MM * 0.866;
+}
 
 // Converged means: one agreed root, and every tile's derived (q, r, rot) is the
 // true layout put through one shared rotation + translation — the one that
@@ -222,6 +255,35 @@ static bool converged(char* why, size_t whyLen) {
     }
   }
 
+  // Agreeing on (q, r, rot) is not the same as rendering in one frame. Every
+  // tile's LED coordinates, as the renderer will actually use them, must be the
+  // physical layout put through the SAME rigid transform — the one that lands
+  // the root at the origin unrotated. A half-side twist between a tile's LED
+  // table and its own sides passes every check above and still tears the
+  // picture at each seam, because tile centres stay right while their contents
+  // rotate. (This models a counter-clockwise board: see SIDE_CCW.)
+  double worstLed = 0;
+  for (int t = 0; t < NTILE; t++) {
+    if (!truth[t].present) continue;
+    enter(t);
+    double ox = API_TBL[t].tileX(), oy = API_TBL[t].tileY();
+    const int8_t* lx = API_TBL[t].ledX();
+    const int8_t* ly = API_TBL[t].ledY();
+    for (int i = 0; i < NUM_LEDS; i++) {
+      double ex, ey;
+      led_truth(t, i, truth[root].q, truth[root].r, &ex, &ey);
+      rot_deg(&ex, &ey, 60.0 * K);
+      double dx = (ox + lx[i]) - ex, dy = (oy + ly[i]) - ey;
+      double d = sqrt(dx * dx + dy * dy);
+      if (d > worstLed) worstLed = d;
+    }
+  }
+  if (worstLed > MAX_LED_ERR_MM) {
+    snprintf(why, whyLen, "LED frame off by %.1f mm (%.0f deg twist at the rim?)",
+             worstLed, worstLed / 43.0 * 180.0 / M_PI);
+    return false;
+  }
+
   int spread = 0;
   for (int a = 0; a < NTILE; a++) {
     if (!truth[a].present) continue;
@@ -237,7 +299,8 @@ static bool converged(char* why, size_t whyLen) {
     snprintf(why, whyLen, "clocks %d ms apart", spread);
     return false;
   }
-  snprintf(why, whyLen, "root %u, clock spread %d ms", rootID, spread);
+  snprintf(why, whyLen, "root %u, clock spread %d ms, LEDs within %.1f mm",
+           rootID, spread, worstLed);
   return true;
 }
 

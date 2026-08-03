@@ -6,9 +6,12 @@
 static const int8_t DQ[6] = { 1, 0, -1, -1, 0, 1 };
 static const int8_t DR[6] = { 0, 1, 1, 0, -1, -1 };
 
-// cos/sin of d*60deg scaled by 128, for rotating LED coordinates.
-static const int8_t COS128[6] = { 127, 64, -64, -127, -64, 64 };
-static const int8_t SIN128[6] = { 0, 111, 111, 0, -111, -111 };
+// cos/sin of d*30deg scaled by 128, for rotating LED coordinates. Rotation is
+// a whole number of 60 deg steps, but the LED table's own theta = 0 can sit
+// half a side away from side 0 (LED_THETA0_HALF_STEPS), so the table is indexed
+// in 30 deg steps to absorb that.
+static const int8_t COS128[12] = { 127, 111, 64, 0, -64, -111, -127, -111, -64, 0, 64, 111 };
+static const int8_t SIN128[12] = { 0, 64, 111, 127, 111, 64, 0, -64, -111, -127, -111, -64 };
 
 static_assert(ANIM_PERIOD_MS < 65535U, "anim period must fit the 16-bit clock");
 
@@ -49,6 +52,18 @@ int16_t  topo_tile_y()    { return tileY; }
 const int8_t* topo_led_gx() { return gx; }
 const int8_t* topo_led_gy() { return gy; }
 
+#if DEBUG_PATTERN == DBG_TOPOLOGY
+static int8_t  myParent = -1;
+static uint8_t syncCount;      // beacons actually folded into the clock
+static int16_t syncErr;        // clock error the last of them carried, ms
+bool     topo_is_root()     { return myRoot == myID; }
+uint8_t  topo_hop()         { return myHop; }
+uint8_t  topo_rot()         { return myRot; }
+int8_t   topo_parent_side() { return myParent; }
+uint8_t  topo_sync_count()  { return syncCount; }
+int16_t  topo_clock_err()   { return syncErr; }
+#endif
+
 static uint8_t mod6(int8_t v) { while (v < 0) v += 6; return (uint8_t)v % 6; }
 
 // Divide to nearest, away from zero on a tie, so +r and -r rows stay symmetric.
@@ -57,13 +72,30 @@ static int16_t div_round(int32_t num, int32_t den) {
 }
 
 static void rebuild_led_cache() {
-  int8_t c = COS128[myRot], s = SIN128[myRot];
-#if !SIDE_CCW
-  s = -s;                      // clockwise physical side numbering
+  // Turn the tile's own LED table into the shared frame: 60 deg per rotation
+  // step, plus the fixed half-side offset between the table's theta = 0 and
+  // side 0's normal. Clockwise-numbered boards are handled by mirroring the
+  // table below, which turns them into counter-clockwise ones and flips the
+  // sense of that offset with them.
+#if SIDE_CCW
+  int8_t half = LED_THETA0_HALF_STEPS;
+#else
+  int8_t half = -LED_THETA0_HALF_STEPS;
 #endif
+  uint8_t a = (uint8_t)((2 * (int8_t)myRot + half + 12) % 12);
+  int8_t c = COS128[a], s = SIN128[a];
   for (uint8_t i = 0; i < NUM_LEDS; i++) {
     int16_t x = (int8_t)pgm_read_byte(&LED_X[i]);
     int16_t y = (int8_t)pgm_read_byte(&LED_Y[i]);
+#if !SIDE_CCW
+    // A clockwise-numbered tile is a mirrored counter-clockwise one. The map
+    // from grid to screen then contains a reflection, so the whole picture is
+    // mirrored — still seamless, which is all that matters. Reflecting here is
+    // not the same as rotating backwards: a rotation cannot undo a handedness
+    // flip, and using one leaves every tile individually mirrored against
+    // correct tile centres.
+    y = -y;
+#endif
     gx[i] = (int8_t)((x * c - y * s) >> 7);
     gy[i] = (int8_t)((x * s + y * c) >> 7);
   }
@@ -164,6 +196,10 @@ void topo_update() {
     rootAgeStamp  = pn.lastHeard;
   }
 
+#if DEBUG_PATTERN == DBG_TOPOLOGY
+  myParent = parent;
+#endif
+
   bool moved = (newRot != myRot) || (newQ != myQ) || (newR != myR);
   myRoot = bestRoot; myHop = bestHop;
   myRot = newRot; myQ = newQ; myR = newR;
@@ -197,6 +233,10 @@ void topo_update() {
       // Parent's clock at "now" = beacon timestamp + airtime + elapsed since RX.
       uint16_t target = pn.info.t + AIR_DELAY_MS + (uint16_t)(now - pn.lastHeard);
       int16_t err = (int16_t)(target - topo_anim_time());
+#if DEBUG_PATTERN == DBG_TOPOLOGY
+      syncCount++;
+      syncErr = err;
+#endif
       if (err > 800 || err < -800)   animOffset += (uint16_t)err;   // jump
       else if (err > SLEW_MS)        animOffset += SLEW_MS;
       else if (err < -(int16_t)SLEW_MS) animOffset -= SLEW_MS;

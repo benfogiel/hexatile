@@ -31,3 +31,12 @@ int16_t  topo_tile_x();                    // tile centre in global mm
 int16_t  topo_tile_y();
 const int8_t* topo_led_gx();               // per-LED rotated local x (mm)
 const int8_t* topo_led_gy();
+
+#if DEBUG_PATTERN == DBG_TOPOLOGY
+bool     topo_is_root();
+uint8_t  topo_hop();
+uint8_t  topo_rot();
+int8_t   topo_parent_side();               // my side the coordinate came from, -1 if root
+uint8_t  topo_sync_count();                // beacons folded into the clock, wraps
+int16_t  topo_clock_err();                 // error the last of them carried, ms
+#endif

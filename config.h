@@ -31,11 +31,27 @@
 #define LED_SHOW_US        ((uint16_t)(NUM_LEDS * 30U))
 
 // Side numbering. SIDE_PIN[s] is the pin for side s. Sides MUST be numbered
-// going COUNTER-CLOCKWISE around the tile (viewed from the LED face), and
-// side 0 must face the direction of LED theta = 0 in your layout table.
+// going COUNTER-CLOCKWISE around the tile (viewed from the LED face).
 // If your physical numbering is clockwise, set SIDE_CCW to 0.
 #define NUM_SIDES          6
 #define SIDE_CCW           1
+
+// Where LED theta = 0 sits relative to side 0's outward normal, counted in
+// 30 deg CCW steps viewed from the LED face. Every ring in led_layout.h starts
+// at theta = 0, so this is asking one question about the board: does that spoke
+// run through the MIDDLE of a side (0), or does it point at a CORNER (+1 or -1,
+// i.e. half a side away)?
+//
+// Only 60 deg of this is free — a whole-side error just rotates the finished
+// picture uniformly, which is harmless. The half-side part is not: the rotation
+// cache can only turn LEDs in 60 deg steps, so a 30 deg error survives to the
+// screen as every tile's picture twisted about its own centre while the tile
+// centres stay right. That reads as a seam no pitch tuning can close.
+//
+// Check it with DBG_TOPOLOGY: the side arcs must sit centred on the physical
+// sides. Straddling a corner means this wants +/-1; centred on the NEXT side
+// over means the sign is backwards.
+#define LED_THETA0_HALF_STEPS  1
 
 // ============================================================================
 // Protocol tuning
@@ -56,6 +72,22 @@
 // ROOT_MAX_AGE_MS / BEACON_MS hops.
 #define ROOT_AGE_UNIT_MS   32       // resolution of the age byte (255 * 32 = 8.1 s)
 #define ROOT_MAX_AGE_MS    5000U
+
+// ============================================================================
+// Debug patterns
+// ============================================================================
+// Set DEBUG_PATTERN to one of these and every tile renders it instead of the
+// normal animation cycle (animID is ignored, and the unused effects compile
+// out). They exist as separate modes because a single pattern cannot tell you
+// whether a fault is in the clock or in the map — each of the first two holds
+// one of those constant so the other is the only thing you are looking at.
+#define DBG_OFF        0
+#define DBG_SYNC       1   // clock only — no position input at all
+#define DBG_GEOMETRY   2   // map only — frozen in time
+#define DBG_TOPOLOGY   3   // direct readout of what each tile believes
+#define DBG_RINGS      4   // end-to-end: rings expanding from the root tile
+
+#define DEBUG_PATTERN  DBG_TOPOLOGY
 
 // ============================================================================
 // Shared types

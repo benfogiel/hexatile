@@ -20,7 +20,7 @@ its own 91 LEDs locally. The single-wire links only carry tiny, infrequent
 | `led_layout.h` | generated per-LED (x, y) in integer mm, from your polar table |
 | `comms.cpp/.h` | bit-banged half-duplex 9600-baud UART on the 6 side pins, beaconing, neighbor table |
 | `topology.cpp/.h` | root election, coordinate + rotation derivation, clock sync, rotated-LED cache |
-| `anim.cpp/.h` | fixed-point effects (rainbow rings, sweep, plasma), HSV→RGB, brightness cap |
+| `anim.cpp/.h` | fixed-point effects (rainbow rings, sweep, plasma), bring-up patterns, HSV→RGB, brightness cap |
 | `sim/` | host-side regression test for the topology layer (see below) |
 
 ## Protocol (12-byte beacon, ~13 ms airtime)
@@ -105,6 +105,14 @@ tile's derived `(q, r, rot)` is the true physical layout put through a single
 shared rotation + translation. Absolute coordinates are arbitrary — the elected
 root defines the frame — so only their mutual consistency is meaningful.
 
+It then checks the frame the renderer will actually draw in: every tile's LED
+coordinates, tile offset included, must be the physical LED layout put through
+that same one transform, to within 2.5 mm of integer rounding. Agreeing on
+`(q, r, rot)` is not sufficient — a tile can hold an entirely correct coordinate
+and still render its own contents rotated against its physical sides, which
+tears every seam while each tile looks individually fine. Against the code that
+ignored `LED_THETA0_HALF_STEPS`, this check fails at 23.8 mm.
+
 Covered: cold start, root unplugged mid-ring, a tile moved to a new cell and
 rotation, and 20% packet loss. The root-removal case is the one that motivated
 the age byte in the beacon: against the pre-aging code it never recovers at
@@ -114,13 +122,44 @@ What this does **not** cover: anything below `topo_update()`. Bit timing, the
 interrupt masking in `comms.cpp`, WS2812 output and real RF/connector behaviour
 all still need a scope and real tiles.
 
+## Bring-up patterns (`DEBUG_PATTERN` in config.h)
+
+Set `DEBUG_PATTERN` to one of these, reflash every tile, and the normal
+animation cycle is replaced by a diagnostic (`animID` is ignored; the unused
+effects and accessors compile out). A single pattern cannot tell you whether a
+fault is in the clock or in the map, so the first two hold one of those constant
+and leave the other as the only variable. Work down the list — each one assumes
+the ones above it pass.
+
+| Mode | Shows | Reading it |
+|---|---|---|
+| `DBG_SYNC` | clock only, no position input | Every tile ramps white over 1.024 s and drops. All tiles should ramp as one surface. A tile at a different brightness is off by that fraction of a second; one that drifts and snaps back is slewing, and is not hearing beacons often enough. |
+| `DBG_GEOMETRY` | map only, frozen in time | A still rainbow centred on the root with a black contour ring every 128 mm. Contours must cross tile seams unbroken. A rotated-looking tile has the wrong `rot`; one whose rings are centred on itself never got placed; a discontinuity that jumps by a whole tile is a wrong `TILE_PITCH_MM`. |
+| `DBG_TOPOLOGY` | what each tile believes, no animation at all | Centre white = root, dim red = follower. Ring 1: one blue LED per hop. Ring 2: a cyan spinner stepping once per beacon folded into the clock (~2.5 steps/s per parent) — frozen under a green arc means packets arrive but never reach the clock. Ring 3: an orange marker pointing where the tile thinks global +x is; all markers must point the same physical direction. Ring 4: clock error against the parent, one LED per 8 ms, clockwise = behind, green and short = locked. Outer ring: a green arc per side with a live neighbor, white on the side the coordinate came from. Following the white arcs walks you back up the tree. |
+| `DBG_RINGS` | end-to-end | 32 mm cyan bands expanding from the root at 125 mm/s. Hard edges rather than a gradient, because a rainbow can look continuous across a bad seam and a band edge cannot. |
+
+`DBG_TOPOLOGY` is the one that separates a comms fault from a placement fault:
+it reads the neighbor table directly, so a side that is mated but shows no arc
+is a link problem, not a topology problem.
+
 ## Things you must verify on real hardware (config.h)
 
 1. `TILE_PITCH_MM` — centre-to-centre distance of two mated tiles (2 ×
    hexagon apothem). Cross-tile coherence depends on this being right. Odd
    values are fine, but keep it an integer: a decimal here pulls the AVR float
    library into the build for ~610 bytes.
-2. Side numbering: `SIDES[]` in comms.cpp maps side index 0..5 → PA5, PA4,
+   Sanity-check it against `led_layout.h`: the outer LED ring sits at r ≈ 43 mm,
+   so the apothem cannot be smaller than that. The current 85 implies an apothem
+   of 42.5 and would put the outermost LEDs off the edge of the board, so it is
+   at best 1–2 mm short and wants measuring.
+2. `LED_THETA0_HALF_STEPS` — whether the LED table's theta = 0 spoke runs
+   through the middle of side 0 (`0`) or points at a corner (`±1`). The rotation
+   cache only turns LEDs in 60° steps, so a half-side error here cannot be
+   absorbed anywhere downstream: tile centres land correctly while each tile's
+   *contents* sit 30° rotated, which is ~24 mm of misplacement at the rim.
+   `DBG_TOPOLOGY` shows it directly — the side arcs must be centred on the
+   physical sides, not straddling the corners.
+3. Side numbering: `SIDES[]` in comms.cpp maps side index 0..5 → PA5, PA4,
    PA2, PB0, PB1, PA7, i.e. the board's silkscreen labels 1..6. The firmware
    assumes sides run **counter-clockwise viewed from the LED face**; if your
    numbering is clockwise, set `SIDE_CCW 0`. Which side is index 0 only rotates
@@ -128,14 +167,17 @@ all still need a scope and real tiles.
    **Check which face you counted from**: reading the silkscreen from the back
    of the PCB reverses the handedness, and that is the single easiest way to
    get a plausible-looking build that places every neighbour in the wrong cell.
-3. `BRIGHTNESS` vs. connector current: at 64/255 a full-white tile is
+   `DBG_GEOMETRY` catches it — with the handedness wrong, tiles land in
+   mirrored cells and the contour rings break at every seam even though each
+   tile individually looks fine.
+4. `BRIGHTNESS` vs. connector current: at 64/255 a full-white tile is
    roughly 1.3 A.
-4. RX bit timing: scope one side; if sampling drifts, trim the `- 2` fudge
+5. RX bit timing: scope one side; if sampling drifts, trim the `- 2` fudge
    constants in `rx_byte`/`tx_byte` or drop `COMMS_BAUD` to 4800. Note that
    bits are now timed with the millis interrupt live, which adds a couple of
    microseconds of jitter per bit against a 52 µs half-bit margin — 4800 baud
    doubles that margin if the links turn out to be marginal.
-5. `ROOT_MAX_AGE_MS` — raise it if you build an assembly more than ~12 tiles
+6. `ROOT_MAX_AGE_MS` — raise it if you build an assembly more than ~12 tiles
    across, lower it for faster recovery when the root is unplugged.
 
 ## Known limitations / next steps
