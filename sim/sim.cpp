@@ -7,9 +7,8 @@
 // firmware headers are included globally first, so the namespaced includes
 // pick up only the .cpp body (their include guards are already satisfied).
 //
-// Everything below the firmware is a model: ../sim/Arduino.h fakes millis()
-// and SIGROW, and this file fakes the wire — beacons are handed to whichever
-// tile is physically mated to the sending side, after AIR_DELAY_MS.
+// Everything else here is a model: Arduino.h fakes millis() and SIGROW, and
+// this file fakes the wire.
 
 #include <stdio.h>
 #include <string.h>
@@ -90,19 +89,17 @@ static uint32_t trueMs;
 static int      lossPercent;
 
 // Transmitting masks every side's pin interrupt for the whole packet, so a tile
-// is deaf on all six sides while it beacons on any one of them. That is the
-// dominant loss on a lightly populated assembly: the beacons a tile sends into
-// its OPEN edges are pure self-inflicted deafness on the edge that is mated.
+// is deaf on all six sides while it beacons on any one of them.
 static uint32_t deafUntil[NTILE];
 static int      pktSent, pktLostDeaf, pktDelivered;
 
 // The render loop hands LED_SHOW_US back to the clock after every strip.show(),
-// on the assumption that millis() lost exactly that much with interrupts off.
-// At ~70 fps that is ~190 ms/s of open-loop rate adjustment, so whatever part of
-// the assumption is wrong is a rate error — and it scales with a tile's frame
-// rate, which is not the same on two tiles doing different amounts of comms.
-// showLoss is the fraction millis() REALLY loses; 1.0 makes the compensation
-// exactly right and 0.0 makes every bit of it error.
+// assuming millis() lost exactly that much. At ~70 fps that is ~190 ms/s of
+// open-loop rate adjustment, so whatever part of the assumption is wrong is a
+// rate error — and it scales with a tile's frame rate, which two tiles doing
+// different amounts of comms do not share. showLoss is the fraction millis()
+// REALLY loses: 1.0 makes the compensation exactly right, 0.0 makes all of it
+// error.
 static double fps[NTILE];
 static double showLoss;
 static double frameAcc[NTILE];
@@ -164,7 +161,7 @@ static void tile_comms(int t) {
     if ((int16_t)(now - nextBeacon[t][s]) >= 0) {
       NodeInfo info;
       API_TBL[t].fill(&info, s);
-      deafUntil[t] = trueMs + AIR_DELAY_MS;    // sending blinds every side
+      deafUntil[t] = trueMs + AIR_DELAY_MS;
       int back, u = mate_of(t, s, &back);
       if (u >= 0 && qn < 256 && (rand() % 100) >= lossPercent) {
         pktSent++;
@@ -187,9 +184,8 @@ static void deliver_due() {
   for (int i = 0; i < qn; ) {
     if (queue[i].dueMs > trueMs) { i++; continue; }
     int d = queue[i].dst;
-    // Receiving needs the whole packet: if the destination was transmitting at
-    // any point while this one was in the air, it missed bytes and the CRC
-    // drops it.
+    // Receiving needs the whole packet: a destination that transmitted at any
+    // point while this one was in the air missed bytes, and the CRC drops it.
     bool deaf = deafUntil[d] > queue[i].dueMs - AIR_DELAY_MS;
     if (truth[d].present && !deaf) {
       pktDelivered++;
@@ -214,8 +210,8 @@ static void run_ms(uint32_t ms) {
       tile_comms(t);
       API_TBL[t].update();
 
-      // Render frames at this tile's own rate, each one stopping millis() for
-      // its share of the LED blackout and handing back the compile-time guess.
+      // Render frames at this tile's own rate, each stopping millis() for its
+      // share of the LED blackout and handing back the compile-time guess.
       frameAcc[t] += fps[t] / 1000.0;
       while (frameAcc[t] >= 1.0) {
         frameAcc[t] -= 1.0;
@@ -231,9 +227,9 @@ static void run_ms(uint32_t ms) {
 #define MAX_CLOCK_SPREAD_MS 60
 
 // Where the renderer may put an LED versus where it physically is, once the
-// whole assembly is put through its one shared transform. The budget is integer
-// rounding only: the >>7 fixed-point rotation truncates, and 127/111 stand in
-// for 128 cos 0 / 128 cos 30.
+// whole assembly is put through its one shared transform. The budget covers
+// integer rounding only: the >>7 fixed-point rotation truncates, and 127/111
+// stand in for 128 cos 0 / 128 cos 30.
 #define MAX_LED_ERR_MM 2.5
 
 static void rot60(int* q, int* r) { int nq = -*r, nr = *q + *r; *q = nq; *r = nr; }
@@ -247,9 +243,9 @@ static void rot_deg(double* x, double* y, double deg) {
 
 // Physical truth for one LED: tile centre from the axial cell, plus the LED's
 // own table entry turned to the tile's real orientation. The table's theta = 0
-// is LED_THETA0_HALF_STEPS half-sides away from side 0's normal, and side 0's
-// normal physically points along the tile's rotation — that offset is the whole
-// subject of the check below.
+// sits LED_THETA0_HALF_STEPS half-sides from side 0's normal, which physically
+// points along the tile's rotation — that offset is the subject of the check
+// below.
 static void led_truth(int t, int i, int qOrigin, int rOrigin, double* x, double* y) {
   *x = (double)(int8_t)pgm_read_byte(&LED_X[i]);
   *y = (double)(int8_t)pgm_read_byte(&LED_Y[i]);
@@ -303,11 +299,10 @@ static bool converged(char* why, size_t whyLen) {
 
   // Agreeing on (q, r, rot) is not the same as rendering in one frame. Every
   // tile's LED coordinates, as the renderer will actually use them, must be the
-  // physical layout put through the SAME rigid transform — the one that lands
-  // the root at the origin unrotated. A half-side twist between a tile's LED
-  // table and its own sides passes every check above and still tears the
-  // picture at each seam, because tile centres stay right while their contents
-  // rotate. (This models a counter-clockwise board: see SIDE_CCW.)
+  // physical layout put through that same transform. A half-side twist between
+  // a tile's LED table and its own sides passes every check above and still
+  // tears the picture at each seam, because tile centres stay right while their
+  // contents rotate. (Models a counter-clockwise board: see SIDE_CCW.)
   double worstLed = 0;
   for (int t = 0; t < NTILE; t++) {
     if (!truth[t].present) continue;
@@ -352,7 +347,6 @@ static bool converged(char* why, size_t whyLen) {
 
 static int failures;
 
-// Run up to limitSec, reporting how long convergence actually took.
 static void expect_within(const char* what, int limitSec) {
   char why[128];
   for (int sec = 1; sec <= limitSec; sec++) {
@@ -385,7 +379,7 @@ static void build_flower() {
 }
 
 // Two tiles on a bench: one mated edge each, ten open ones between them. The
-// interesting number here is not convergence but how much of the only link that
+// interesting number is not convergence but how much of the only link that
 // exists survives the deafness both tiles inflict on themselves.
 static void build_pair() {
   static const uint8_t IDS[2] = { 40, 90 };
@@ -408,8 +402,7 @@ static void build_pair() {
 // see a rate error win: a sync loop that cannot hold its parent still looks
 // perfect one second in. So soak the pair and watch what it *holds* — the worst
 // clock spread, and the longest the follower spends believing it is a root
-// again (centre white, rotation reset, which is what a dropped neighbor looks
-// like on the tile).
+// again, which is what a dropped neighbor looks like on the tile.
 static void soak_pair(int seconds, int* worstGapMs, int* worstSpreadMs) {
   int gap = 0;
   *worstGapMs = 0;
@@ -434,16 +427,15 @@ static void soak_pair(int seconds, int* worstGapMs, int* worstSpreadMs) {
 
 int main() {
   srand(1);
-  showLoss = 1.0;    // compensation exactly right: the honest worst case for noise
+  showLoss = 1.0;    // compensation exactly right: the honest case for noise
 
   printf("\n7-tile flower, clock skew + /-0.6%% rate error\n");
   lossPercent = 0;
   build_flower();
   expect_within("cold start converges", 10);
 
-  // The point of the age byte in the beacon. Before it existed, the six
-  // survivors kept relaying the dead root forever, hop count counting up to
-  // 255 and wrapping, and this never recovered at all.
+  // The case that motivated the age byte: before it existed the six survivors
+  // relayed the dead root forever and this never recovered at all.
   printf("\nroot tile (id 20) unplugged from the ring\n");
   truth[3].present = false;
   for (int s = 0; s < NUM_SIDES; s++) g_nbr[3][s].present = false;

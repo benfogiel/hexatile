@@ -1,27 +1,24 @@
 #include "anim.h"
 #include "topology.h"
 
-// Modes that still evaluate color = f(global x, global y, t) per LED, and so
-// keep the shared coordinate loop and its helpers.
 #define RENDERS_FROM_COORDS (DEBUG_PATTERN == DBG_OFF      || \
                              DEBUG_PATTERN == DBG_GEOMETRY || \
                              DEBUG_PATTERN == DBG_RINGS)
 
 #if DEBUG_PATTERN == DBG_OFF
 // ---------------------------------------------------------------------------
-// 8-bit sine, quarter-wave parabola approximation (no table, ~40 B of flash).
+// Quarter-wave parabola approximation of a sine (no table, ~40 B of flash).
 // sin8(0)=128, sin8(64)=255, sin8(128)=128, sin8(192)=1.
 static uint8_t sin8(uint8_t x) {
   uint8_t p = x & 0x7F;                 // half-wave phase
   if (p > 63) p = 127 - p;              // fold to quarter wave, 0..63
-  uint16_t v = (uint16_t)p * (uint16_t)(190 - p);  // peaks near 64*126=8064
+  uint16_t v = (uint16_t)p * (uint16_t)(190 - p);
   uint8_t half = (uint8_t)(v >> 6);     // 0..126
   return (x & 0x80) ? (uint8_t)(127 - half) : (uint8_t)(128 + half);
 }
 #endif
 
 #if RENDERS_FROM_COORDS
-// Integer sqrt of a 32-bit value (used for radial distance).
 static uint16_t isqrt32(uint32_t v) {
   uint32_t res = 0, bit = 1UL << 30;
   while (bit > v) bit >>= 2;
@@ -33,7 +30,7 @@ static uint16_t isqrt32(uint32_t v) {
   return (uint16_t)res;
 }
 
-// HSV -> RGB, s=255, with the global brightness cap folded into v.
+// s = 255, with the global brightness cap folded into v.
 static void hsv2rgb(uint8_t h, uint8_t v, uint8_t* rgb) {
   v = (uint8_t)(((uint16_t)v * (BRIGHTNESS + 1)) >> 8);
   uint8_t region = h / 43;
@@ -51,7 +48,6 @@ static void hsv2rgb(uint8_t h, uint8_t v, uint8_t* rgb) {
   }
 }
 #else
-// The readout modes paint named colors rather than a hue field.
 static void put_rgb(uint8_t* grbBuf, uint8_t i, uint8_t r, uint8_t g, uint8_t b) {
   uint16_t k = (uint16_t)i * 3;
   grbBuf[k + 0] = (uint8_t)(((uint16_t)g * (BRIGHTNESS + 1)) >> 8);   // WS2812B is GRB
@@ -65,7 +61,7 @@ static void put_rgb(uint8_t* grbBuf, uint8_t i, uint8_t r, uint8_t g, uint8_t b)
 
 // The layout is six concentric rings around a centre LED: ring k holds 6k LEDs
 // (1 + 6 + 12 + 18 + 24 + 30 = 91), evenly spaced and running CLOCKWISE from
-// local theta = 0, so ring k starts at LED 1 + 3k(k-1).
+// local theta = 0.
 static uint8_t ring_first(uint8_t ring) { return (uint8_t)(1 + 3 * ring * (ring - 1)); }
 
 // Paint the LEDs of one ring that face a given side. Side s sits at local angle
@@ -89,7 +85,8 @@ static void paint_side(uint8_t* grbBuf, uint8_t ring, uint8_t side,
 }
 
 // No animation at all — each tile just states its own beliefs, so a wrong
-// picture can be traced to the tile that holds the wrong belief.
+// picture can be traced to the tile that holds the wrong belief. See the
+// bring-up table in the README for how to read the result.
 static void render_topology(uint8_t* grbBuf) {
   for (uint16_t k = 0; k < (uint16_t)NUM_LEDS * 3; k++) grbBuf[k] = 0;
 
@@ -99,20 +96,15 @@ static void render_topology(uint8_t* grbBuf) {
   uint8_t hop = topo_hop();                       // ring 1: one blue LED per hop
   for (uint8_t h = 0; h < hop && h < 6; h++) put_rgb(grbBuf, (uint8_t)(1 + h), 0, 0, 255);
 
-  // Ring 2: one step per beacon actually folded into the clock, so the sync
-  // loop's input rate is visible. A steady crawl (~2.5 steps/s per parent) means
-  // it is being fed; a frozen spinner under a green arc means packets arrive but
-  // are never used; a spinner that stalls in bursts is a marginal link.
+  // Ring 2: a spinner stepping once per beacon folded into the clock, so the
+  // sync loop's input rate is visible.
   put_rgb(grbBuf, (uint8_t)(ring_first(2) + topo_sync_count() % 12), 0, 200, 200);
 
-  // Ring 3: where this tile believes global +x lies. Every marker in the
-  // assembly points the same way physically once the rotations are right.
+  // Ring 3: where this tile believes global +x lies.
   paint_side(grbBuf, 3, (uint8_t)((6 - topo_rot()) % 6), 255, 140, 0);
 
-  // Ring 4: how far this tile's clock is from its parent's, one LED per 8 ms,
-  // growing clockwise when behind and anticlockwise when ahead. Green and short
-  // is locked; a long red arm that keeps growing back after each correction is
-  // the slew losing to the oscillator, not a link fault.
+  // Ring 4: clock error against the parent, one LED per 8 ms, growing clockwise
+  // when behind and anticlockwise when ahead, red past 16 ms.
   if (!root) {
     int16_t err = topo_clock_err();
     uint16_t mag = (uint16_t)(err < 0 ? -err : err);
@@ -125,8 +117,8 @@ static void render_topology(uint8_t* grbBuf) {
     }
   }
 
-  // Outer ring: an arc per side, green where a neighbor is heard and white on
-  // the side this tile took its coordinate from.
+  // Outer ring: green arc per side with a live neighbor, white on the side this
+  // tile took its coordinate from.
   int8_t parent = topo_parent_side();
   for (uint8_t s = 0; s < NUM_SIDES; s++) {
     Neighbor n;
@@ -143,10 +135,9 @@ static void render_topology(uint8_t* grbBuf) {
 // every tile; only (x, y) differs, so the picture is seamless across tiles.
 void anim_render(uint8_t* grbBuf) {
 #if DEBUG_PATTERN == DBG_SYNC
-  // Position is never consulted: the whole tile ramps up over 1.024 s and
-  // drops, so anything left on screen is the clock alone. Tiles in step ramp
-  // together; one out of step sits at a visibly different brightness. The
-  // period divides 65536 exactly, so the clock's 16-bit wrap is seamless.
+  // Position is never consulted, so anything on screen is the clock alone: the
+  // whole tile ramps over 1.024 s and drops. That period divides 65536 exactly,
+  // so the clock's 16-bit wrap is seamless.
   uint8_t v = (uint8_t)((topo_anim_time() & 1023U) >> 2);
   for (uint8_t i = 0; i < NUM_LEDS; i++) put_rgb(grbBuf, i, v, v, v);
 
@@ -192,15 +183,14 @@ void anim_render(uint8_t* grbBuf) {
     }
 #elif DEBUG_PATTERN == DBG_GEOMETRY
     // Time is frozen, so the picture is pure map: a still rainbow centred on
-    // the root, with a black contour ring every 128 mm. A tile in the wrong
-    // cell or at the wrong rotation breaks the contour at its own edge.
+    // the root with a black contour ring every 128 mm. A tile in the wrong cell
+    // or at the wrong rotation breaks the contour at its own edge.
     uint16_t d = isqrt32((int32_t)x * x + (int32_t)y * y);
     hue = (uint8_t)(d << 1);
     if ((d & 127) < 3) val = 0;
 #else   // DBG_RINGS
-    // Both inputs at once, but as hard-edged bands rather than a gradient: a
-    // rainbow can look continuous across a bad seam, a band edge cannot.
-    // 32 mm bands travelling outward at 125 mm/s.
+    // 32 mm bands travelling outward at 125 mm/s. Hard edges rather than a
+    // gradient: a rainbow can look continuous across a bad seam, a band cannot.
     uint16_t d = isqrt32((int32_t)x * x + (int32_t)y * y);
     hue = 128;
     val = ((uint8_t)(d - (t >> 3)) & 63) < 32 ? 255 : 0;

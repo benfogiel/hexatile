@@ -2,103 +2,89 @@
 #include <Arduino.h>
 
 // ============================================================================
-// Hardware configuration — VERIFY THESE AGAINST YOUR BOARD
+// Hardware — VERIFY THESE AGAINST YOUR BOARD
 // ============================================================================
 
-// WS2812B data pin (Arduino pin 2 on megaTinyCore = PA6)
-#define LED_PIN            PIN_PA6
-
-// Number of LEDs per tile
+#define LED_PIN            PIN_PA6      // megaTinyCore Arduino pin 2
 #define NUM_LEDS           91
 
-// Global brightness cap, 0-255. 64 = 25%. At 25% a full-white tile draws
-// roughly 1.3 A — size this to what your magnetic connectors can carry.
+// 0-255. At 64 (25%) a full-white tile draws ~1.3 A — size this to what the
+// magnetic connectors can carry.
 #define BRIGHTNESS         20
 
-// Centre-to-centre distance between two mated tiles (2 * hexagon apothem), in
-// mm. Animations stay coherent across tile boundaries only if this matches
-// reality, so measure it on real hardware. Odd values are fine.
-//
-// Keep it an integer: this feeds integer grid maths, and a decimal here
-// promotes those expressions to double, dragging the AVR float library into
-// the build for ~610 bytes of flash to compute two numbers that only change
-// when a tile is moved.
+// Centre-to-centre distance between two mated tiles (2 * apothem), in mm.
+// Measure it on real hardware: animations stay coherent across tile boundaries
+// only if this matches reality. Keep it an integer — a decimal here promotes
+// the grid maths to double and drags in the AVR float library (~610 B of flash)
+// to compute two numbers that only change when a tile is moved.
 #define TILE_PITCH_MM      85
 
 // strip.show() bit-bangs WS2812 timing with interrupts off, so millis() stops
-// for its duration: 24 bits per LED at 1.25 us each. The animation clock adds
-// this back after every frame.
+// for its duration: 24 bits per LED at 1.25 us each.
 #define LED_SHOW_US        ((uint16_t)(NUM_LEDS * 30U))
 
-// Side numbering. SIDE_PIN[s] is the pin for side s. Sides MUST be numbered
-// going COUNTER-CLOCKWISE around the tile (viewed from the LED face).
-// If your physical numbering is clockwise, set SIDE_CCW to 0.
+// Sides MUST be numbered counter-clockwise around the tile, viewed from the LED
+// face. Set SIDE_CCW to 0 if the physical numbering runs clockwise.
 #define NUM_SIDES          6
 #define SIDE_CCW           1
 
-// Where LED theta = 0 sits relative to side 0's outward normal, counted in
-// 30 deg CCW steps viewed from the LED face. Every ring in led_layout.h starts
-// at theta = 0, so this is asking one question about the board: does that spoke
-// run through the MIDDLE of a side (0), or does it point at a CORNER (+1 or -1,
-// i.e. half a side away)?
+// Where LED theta = 0 sits relative to side 0's outward normal, in 30 deg CCW
+// steps: does that spoke run through the MIDDLE of a side (0) or point at a
+// CORNER (+1 or -1)?
 //
-// Only 60 deg of this is free — a whole-side error just rotates the finished
-// picture uniformly, which is harmless. The half-side part is not: the rotation
-// cache can only turn LEDs in 60 deg steps, so a 30 deg error survives to the
-// screen as every tile's picture twisted about its own centre while the tile
-// centres stay right. That reads as a seam no pitch tuning can close.
+// Only the half-side part matters. A whole-side error just rotates the finished
+// picture uniformly; a 30 deg error cannot be absorbed by the rotation cache
+// (which turns LEDs in 60 deg steps) and survives to the screen as every tile's
+// picture twisted about its own centre while the tile centres stay right.
 //
-// Check it with DBG_TOPOLOGY: the side arcs must sit centred on the physical
-// sides. Straddling a corner means this wants +/-1; centred on the NEXT side
-// over means the sign is backwards.
+// Check with DBG_TOPOLOGY: side arcs must sit centred on the physical sides.
+// Straddling a corner means this wants +/-1; centred on the NEXT side over means
+// the sign is backwards.
 #define LED_THETA0_HALF_STEPS  1
 
 // ============================================================================
 // Protocol tuning
 // ============================================================================
 #define COMMS_BAUD         9600UL
-#define BEACON_MS          400      // beacon interval on a side that has a neighbor
+#define BEACON_MS          400
 
-// Beacon interval on a side that has none. Transmitting masks every side's pin
-// interrupt for the whole 13 ms packet, so a beacon into an open edge is 13 ms
-// of deafness on the edges that are actually mated — and on a small assembly
-// most edges are open, which makes that the single largest source of loss on
-// the links that matter. Open sides only have to beacon often enough to notice
-// a tile being attached, so they back off to discovery duty.
+// Transmitting masks every side's pin interrupt for the whole 13 ms packet, so
+// a beacon into an open edge is 13 ms of deafness on the edges that are mated —
+// the largest source of loss on a small assembly, where most edges are open.
+// Open sides only need to beacon often enough to notice a tile being attached.
 #define IDLE_BEACON_MS     1600
 
-// Fast beacons a side keeps sending after its neighbor disappears, before it
-// accepts the loss and drops to the idle rate. Backing off immediately makes a
-// dropped link self-sustaining: the side goes quiet exactly when it needs to
-// re-acquire, so the outage lasts seconds rather than one beacon.
+// Fast beacons a side keeps sending after its neighbor disappears. Backing off
+// immediately makes a dropped link self-sustaining: the side goes quiet exactly
+// when it needs to re-acquire, so the outage lasts seconds rather than one
+// beacon.
 #define LINK_GRACE_BEACONS 25
 
-// Side considered vacated after this. It has to cover a burst of loss, not just
-// one packet: at BEACON_MS this is the number of consecutive misses that will
-// drop a live neighbor and send the tile back to believing it is a root.
+// Has to cover a burst of loss, not just one packet: at BEACON_MS this is the
+// number of consecutive misses that drops a live neighbor and sends the tile
+// back to believing it is a root.
 #define NEIGHBOR_TIMEOUT_MS 3000
-#define AIR_DELAY_MS       13       // airtime of one 12-byte packet (for time sync)
-#define ANIM_PERIOD_MS     20000U   // root cycles animation every 20 s (must be < 65535)
+
+#define AIR_DELAY_MS       13       // airtime of one 12-byte packet
+#define ANIM_PERIOD_MS     20000U   // root's dwell per animation
 #define NUM_ANIMS          3
 
 // Root-information aging — the spanning tree's loop breaker. Every beacon
-// carries how long ago the root generated the information it is relaying.
-// The root always says 0; everyone else adds the delay it took to reach them.
-// In a cycle with no root, nothing resets the age, so it climbs past the limit,
-// every tile refuses the stale root and the election re-runs from scratch.
-// ROOT_MAX_AGE_MS caps the usable network diameter at roughly
-// ROOT_MAX_AGE_MS / BEACON_MS hops.
+// carries how long ago the root generated the information it relays: the root
+// says 0, everyone else adds the delay it took to reach them. In a cycle with no
+// root nothing resets the age, so it climbs past the limit, every tile refuses
+// the stale root and the election re-runs. This caps the usable network diameter
+// at roughly ROOT_MAX_AGE_MS / BEACON_MS hops.
 #define ROOT_AGE_UNIT_MS   32       // resolution of the age byte (255 * 32 = 8.1 s)
 #define ROOT_MAX_AGE_MS    5000U
 
 // ============================================================================
 // Debug patterns
 // ============================================================================
-// Set DEBUG_PATTERN to one of these and every tile renders it instead of the
-// normal animation cycle (animID is ignored, and the unused effects compile
-// out). They exist as separate modes because a single pattern cannot tell you
-// whether a fault is in the clock or in the map — each of the first two holds
-// one of those constant so the other is the only thing you are looking at.
+// Set DEBUG_PATTERN and every tile renders that instead of the animation cycle
+// (animID is ignored, unused effects compile out). A single pattern cannot tell
+// you whether a fault is in the clock or in the map, so the first two each hold
+// one of those constant.
 #define DBG_OFF        0
 #define DBG_SYNC       1   // clock only — no position input at all
 #define DBG_GEOMETRY   2   // map only — frozen in time
@@ -120,7 +106,7 @@ struct NodeInfo {
   uint8_t  hop;      // distance from root
   uint8_t  age;      // age of this root info, in ROOT_AGE_UNIT_MS units
   uint16_t t;        // sender's animation clock (ms, wraps)
-  uint8_t  animID;   // current animation, chosen by root
+  uint8_t  animID;
 };
 
 struct Neighbor {

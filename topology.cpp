@@ -2,14 +2,13 @@
 #include "comms.h"
 #include "led_layout.h"
 
-// Global hex direction d (0-5, CCW, d=0 along +x): axial coordinate steps.
+// Axial steps for global hex direction d (0-5, CCW, d=0 along +x).
 static const int8_t DQ[6] = { 1, 0, -1, -1, 0, 1 };
 static const int8_t DR[6] = { 0, 1, 1, 0, -1, -1 };
 
-// cos/sin of d*30deg scaled by 128, for rotating LED coordinates. Rotation is
-// a whole number of 60 deg steps, but the LED table's own theta = 0 can sit
-// half a side away from side 0 (LED_THETA0_HALF_STEPS), so the table is indexed
-// in 30 deg steps to absorb that.
+// cos/sin of d*30 deg scaled by 128. Rotation is a whole number of 60 deg
+// steps, but the LED table's own theta = 0 can sit half a side away from side 0
+// (LED_THETA0_HALF_STEPS), so these are indexed in 30 deg steps to absorb that.
 static const int8_t COS128[12] = { 127, 111, 64, 0, -64, -111, -127, -111, -64, 0, 64, 111 };
 static const int8_t SIN128[12] = { 0, 64, 111, 127, 111, 64, 0, -64, -111, -127, -111, -64 };
 
@@ -31,7 +30,6 @@ static uint16_t lastUpdate;
 
 uint16_t topo_anim_time() { return (uint16_t)millis() + animOffset; }
 
-// Time the caller spent with interrupts off, which millis() therefore missed.
 void topo_clock_compensate_us(uint16_t us) {
   compensateUs += us;
   while (compensateUs >= 1000) { compensateUs -= 1000; animOffset++; }
@@ -66,12 +64,10 @@ static int16_t div_round(int32_t num, int32_t den) {
   return (int16_t)((num + (num >= 0 ? den / 2 : -(den / 2))) / den);
 }
 
+// Turn the tile's own LED table into the shared frame: 60 deg per rotation
+// step, plus the fixed half-side offset between the table's theta = 0 and
+// side 0's normal.
 static void rebuild_led_cache() {
-  // Turn the tile's own LED table into the shared frame: 60 deg per rotation
-  // step, plus the fixed half-side offset between the table's theta = 0 and
-  // side 0's normal. Clockwise-numbered boards are handled by mirroring the
-  // table below, which turns them into counter-clockwise ones and flips the
-  // sense of that offset with them.
 #if SIDE_CCW
   int8_t half = LED_THETA0_HALF_STEPS;
 #else
@@ -83,28 +79,25 @@ static void rebuild_led_cache() {
     int16_t x = (int8_t)pgm_read_byte(&LED_X[i]);
     int16_t y = (int8_t)pgm_read_byte(&LED_Y[i]);
 #if !SIDE_CCW
-    // A clockwise-numbered tile is a mirrored counter-clockwise one. The map
-    // from grid to screen then contains a reflection, so the whole picture is
-    // mirrored — still seamless, which is all that matters. Reflecting here is
-    // not the same as rotating backwards: a rotation cannot undo a handedness
-    // flip, and using one leaves every tile individually mirrored against
-    // correct tile centres.
+    // A clockwise-numbered tile is a mirrored counter-clockwise one, so the
+    // whole picture comes out mirrored — still seamless, which is all that
+    // matters. It must be a reflection and not a backwards rotation: a rotation
+    // cannot undo a handedness flip, and leaves every tile individually
+    // mirrored against correct tile centres.
     y = -y;
 #endif
     gx[i] = (int8_t)((x * c - y * s) >> 7);
     gy[i] = (int8_t)((x * s + y * c) >> 7);
   }
-  // Axial -> mm, both terms derived from q/r directly rather than from a
-  // rounded per-row constant, so no error accumulates across the assembly and
-  // a fractional pitch costs nothing.
-  //   x = (2q + r) * pitch/2        y = r * pitch * sin60
-  // Worst case here is |r| = 127: 127 * 85 * 866 fits int32 with room to spare.
+  // Axial -> mm: x = (2q + r) * pitch/2, y = r * pitch * sin60. Both derived
+  // from q/r directly rather than from a rounded per-row constant, so no error
+  // accumulates across the assembly. Worst case |r| = 127 fits int32 easily.
   tileX = div_round((int32_t)((int16_t)myQ * 2 + myR) * TILE_PITCH_MM, 2L);
   tileY = div_round((int32_t)myR * TILE_PITCH_MM * 866L, 1000L);
 }
 
 void topo_init() {
-  // Stable per-chip ID from the factory serial number (avoid 0x00/0xFF).
+  // Stable per-chip ID hashed from the factory serial (0x00/0xFF reserved).
   uint8_t id = 0;
   for (uint8_t i = 0; i < 10; i++)
     id = (uint8_t)(id * 31 + ((volatile uint8_t*)&SIGROW.SERNUM0)[i]);
@@ -148,11 +141,10 @@ void topo_update() {
     if (!n.present) continue;
 
     // How stale the root's information would be if I relayed it now. Only a
-    // path that actually reaches the root ever gets this reset to zero, so in
-    // a root-less cycle every tile's age climbs without bound; refusing
-    // anything past the limit starves the cycle out and re-runs the election.
-    // Without this the hop count just counts to 255, wraps, and the dead root
-    // looks adjacent again — forever.
+    // path that actually reaches the root resets this to zero, so refusing
+    // anything past the limit starves out a root-less cycle and re-runs the
+    // election; hop count alone would count to 255, wrap, and make the dead
+    // root look adjacent again forever.
     uint16_t candAge = (uint16_t)n.info.age * ROOT_AGE_UNIT_MS
                      + AIR_DELAY_MS + (uint16_t)(now - n.lastHeard);
     if (candAge >= ROOT_MAX_AGE_MS) continue;
@@ -180,8 +172,8 @@ void topo_update() {
     rootAgeBaseMs = 0;
     rootAgeStamp  = now;
   } else {
-    // Place myself from the parent's beacon. Parent transmitted on its side
-    // pn.info.side; I received on side `parent`. Mated sides face opposite
+    // Place myself from the parent's beacon: it transmitted on its side
+    // pn.info.side, I received on side `parent`, and mated sides face opposite
     // global directions.
     uint8_t parentDir = mod6((int8_t)(pn.info.rot + pn.info.side));
     newRot = mod6((int8_t)(pn.info.rot + pn.info.side + 3 - parent));
@@ -204,9 +196,8 @@ void topo_update() {
   if (parent < 0) {
     // Root free-runs its clock and picks the animation. Advancing a counter on
     // elapsed time rather than dividing the clock keeps the dwell equal for
-    // every animation; the old modulo of a 16-bit clock jumped mid-sequence
-    // every time that clock wrapped, since 65536 is not a multiple of the
-    // period.
+    // every animation: 65536 is not a multiple of the period, so a modulo of
+    // the 16-bit clock jumps mid-sequence every time that clock wraps.
     if ((uint16_t)(now - animChangedAt) >= ANIM_PERIOD_MS) {
       animChangedAt = now;
       if (++myAnim >= NUM_ANIMS) myAnim = 0;
@@ -215,12 +206,10 @@ void topo_update() {
     myAnim = pn.info.animID;
     animChangedAt = now;    // so a later promotion to root starts a full period
 
-    // Only ever act on a beacon once. Two reasons: this runs at 20 Hz but
-    // beacons arrive at ~2.5 Hz, so re-slewing on a stale measurement would
-    // apply one correction eight times over; and (now - lastHeard) is measured
-    // in millis(), which undercounts real time by the LED blackout duty cycle,
-    // so a stale measurement carries a bias proportional to its own age.
-    // Acting only on a just-arrived packet keeps that term near zero.
+    // Only ever act on a beacon once. This runs at 20 Hz but beacons arrive at
+    // ~2.5 Hz, so re-slewing on a stale measurement would apply one correction
+    // eight times over; and (now - lastHeard) undercounts real time by the LED
+    // blackout duty cycle, a bias proportional to the measurement's own age.
     if (parent != lastSyncSide || pn.lastHeard != lastSyncHeard) {
       lastSyncSide  = parent;
       lastSyncHeard = pn.lastHeard;
@@ -232,18 +221,14 @@ void topo_update() {
       syncCount++;
       syncErr = err;
 #endif
-      // Take the whole error, every time. animOffset is the only handle this
-      // design has on the clock — nothing anywhere adjusts its *rate* — so a
-      // capped correction is not a gentler version of the same thing, it is a
-      // ceiling on how fast a parent's oscillator may run before the child can
-      // never catch it again. A cap of 8 ms at ~2.3 beacons/s put that ceiling
-      // at 1.9%, which two untrimmed RC oscillators clear easily; past it the
-      // error ramped until it tripped a jump, forever.
-      //
-      // Correcting fully leaves only the drift accumulated between beacons
-      // (rate error x ~430 ms, so ~13 ms at 3%) plus a few ms of measurement
-      // noise — under a frame either way, and no worse for being applied at
-      // once, since a jump this small is invisible in any of the effects.
+      // Take the whole error, every time. animOffset is the only handle on the
+      // clock — nothing adjusts its *rate* — so a capped correction is not a
+      // gentler version of this, it is a ceiling on how fast a parent's
+      // oscillator may run before the child can never catch it. An 8 ms cap at
+      // ~2.3 beacons/s put that ceiling at 1.9%, which two untrimmed RC
+      // oscillators clear easily. Correcting fully leaves only the drift
+      // between beacons (~13 ms at 3%) plus measurement noise, which is under a
+      // frame and invisible in any of the effects.
       animOffset += (uint16_t)err;
     }
   }
