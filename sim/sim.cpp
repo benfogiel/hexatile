@@ -59,13 +59,14 @@ struct TileApi {
   void     (*fill)(NodeInfo*, uint8_t);
   uint8_t  (*id)();
   uint16_t (*clock)();
+  void     (*compensate)(uint16_t);
   int16_t  (*tileX)();
   int16_t  (*tileY)();
   const int8_t* (*ledX)();
   const int8_t* (*ledY)();
 };
 #define API(N) { N::topo_init, N::topo_update, N::topo_fill_beacon, \
-                 N::topo_my_id, N::topo_anim_time, \
+                 N::topo_my_id, N::topo_anim_time, N::topo_clock_compensate_us, \
                  N::topo_tile_x, N::topo_tile_y, N::topo_led_gx, N::topo_led_gy }
 static const TileApi API_TBL[NTILE] = {
   API(T0), API(T1), API(T2), API(T3), API(T4), API(T5), API(T6)
@@ -83,6 +84,8 @@ static Truth truth[NTILE];
 static double   rate[NTILE];      // per-tile millis() rate error
 static uint32_t skew[NTILE];      // per-tile millis() origin
 static uint16_t nextBeacon[NTILE][NUM_SIDES];
+static uint8_t  linkGrace[NTILE][NUM_SIDES];
+
 static uint32_t trueMs;
 static int      lossPercent;
 
@@ -93,9 +96,21 @@ static int      lossPercent;
 static uint32_t deafUntil[NTILE];
 static int      pktSent, pktLostDeaf, pktDelivered;
 
+// The render loop hands LED_SHOW_US back to the clock after every strip.show(),
+// on the assumption that millis() lost exactly that much with interrupts off.
+// At ~70 fps that is ~190 ms/s of open-loop rate adjustment, so whatever part of
+// the assumption is wrong is a rate error — and it scales with a tile's frame
+// rate, which is not the same on two tiles doing different amounts of comms.
+// showLoss is the fraction millis() REALLY loses; 1.0 makes the compensation
+// exactly right and 0.0 makes every bit of it error.
+static double fps[NTILE];
+static double showLoss;
+static double frameAcc[NTILE];
+static double lostMs[NTILE];
+
 static void enter(int t) {
   g_tile   = t;
-  g_now_ms = skew[t] + (uint32_t)(trueMs * rate[t]);
+  g_now_ms = skew[t] + (uint32_t)(trueMs * rate[t] - lostMs[t]);
 }
 
 static int find_tile(int q, int r) {
@@ -131,6 +146,7 @@ static void set_id(int t, uint8_t wantID) {
   }
   for (uint8_t s = 0; s < NUM_SIDES; s++) {
     memset(&g_nbr[t][s], 0, sizeof(Neighbor));
+    linkGrace[t][s] = LINK_GRACE_BEACONS;
     nextBeacon[t][s] = (uint16_t)g_now_ms + (uint16_t)s * (BEACON_MS / NUM_SIDES)
                      + (wantID & 0x1F);
   }
@@ -143,6 +159,7 @@ static void tile_comms(int t) {
     if (g_nbr[t][s].present &&
         (uint16_t)(now - g_nbr[t][s].lastHeard) > NEIGHBOR_TIMEOUT_MS)
       g_nbr[t][s].present = false;
+    if (g_nbr[t][s].present) linkGrace[t][s] = LINK_GRACE_BEACONS;
 
     if ((int16_t)(now - nextBeacon[t][s]) >= 0) {
       NodeInfo info;
@@ -157,7 +174,10 @@ static void tile_comms(int t) {
         queue[qn].info    = info;
         qn++;
       }
-      nextBeacon[t][s] = now + (g_nbr[t][s].present ? BEACON_MS : IDLE_BEACON_MS)
+      uint16_t interval = IDLE_BEACON_MS;
+      if (g_nbr[t][s].present) interval = BEACON_MS;
+      else if (linkGrace[t][s]) { interval = BEACON_MS; linkGrace[t][s]--; }
+      nextBeacon[t][s] = now + interval
                        + ((API_TBL[t].id() * 13u + s * 29u + now) & 0x3F);
     }
   }
@@ -193,6 +213,16 @@ static void run_ms(uint32_t ms) {
       enter(t);
       tile_comms(t);
       API_TBL[t].update();
+
+      // Render frames at this tile's own rate, each one stopping millis() for
+      // its share of the LED blackout and handing back the compile-time guess.
+      frameAcc[t] += fps[t] / 1000.0;
+      while (frameAcc[t] >= 1.0) {
+        frameAcc[t] -= 1.0;
+        lostMs[t] += showLoss * LED_SHOW_US / 1000.0;
+        enter(t);
+        API_TBL[t].compensate(LED_SHOW_US);
+      }
     }
   }
 }
@@ -348,6 +378,8 @@ static void build_flower() {
   for (int t = 0; t < NTILE; t++) {
     rate[t] = 1.0 + (t - 3) * 0.002;          // +/-0.6% clock rate error
     skew[t] = (uint32_t)t * 9173u;            // different power-on instants
+    fps[t]  = 70.0 + t;                       // slightly different render rates
+    frameAcc[t] = 0; lostMs[t] = 0; deafUntil[t] = 0;
   }
   for (int t = 0; t < NTILE; t++) set_id(t, IDS[t]);
 }
@@ -362,28 +394,47 @@ static void build_pair() {
   truth[1] = { 1, 0, 4, true };
   qn = 0; trueMs = 0;
   pktSent = pktLostDeaf = pktDelivered = 0;
-  for (int t = 0; t < NTILE; t++) { rate[t] = 1.0; skew[t] = 0; deafUntil[t] = 0; }
-  rate[0] = 0.99; rate[1] = 1.01;         // +/-1%, a realistic pair of internal oscillators
+  for (int t = 0; t < NTILE; t++) {
+    rate[t] = 1.0; skew[t] = 0; deafUntil[t] = 0;
+    fps[t] = 70.0; frameAcc[t] = 0; lostMs[t] = 0;
+  }
+  rate[0] = 0.98; rate[1] = 1.02;
+  fps[0] = 72.0; fps[1] = 66.0;    // the two tiles do not render in lockstep
   skew[1] = 5000;
   for (int t = 0; t < 2; t++) set_id(t, IDS[t]);
 }
 
-// How long the follower can go believing it is a root again, which is what a
-// dropped neighbor looks like on the tile: centre goes white, rotation resets.
-static int worst_gap_ms() {
-  int worst = 0, gap = 0;
-  for (int k = 0; k < 60000; k++) {
+// Convergence is scored the instant it first passes, which is far too early to
+// see a rate error win: a sync loop that cannot hold its parent still looks
+// perfect one second in. So soak the pair and watch what it *holds* — the worst
+// clock spread, and the longest the follower spends believing it is a root
+// again (centre white, rotation reset, which is what a dropped neighbor looks
+// like on the tile).
+static void soak_pair(int seconds, int* worstGapMs, int* worstSpreadMs) {
+  int gap = 0;
+  *worstGapMs = 0;
+  *worstSpreadMs = 0;
+  run_ms(5000);            // let the cold-start offset jump settle out first
+  for (int k = 0; k < seconds * 1000; k++) {
     run_ms(1);
+
     enter(1);
     NodeInfo v; API_TBL[1].fill(&v, 0);
-    if (v.hop == 0) { if (++gap > worst) worst = gap; }
+    if (v.hop == 0) { if (++gap > *worstGapMs) *worstGapMs = gap; }
     else gap = 0;
+
+    enter(0); uint16_t c0 = API_TBL[0].clock();
+    enter(1); uint16_t c1 = API_TBL[1].clock();
+    int d = (int)(int16_t)(c0 - c1);
+    if (d < 0) d = -d;
+    if (d > *worstSpreadMs) *worstSpreadMs = d;
   }
-  return worst;
 }
+
 
 int main() {
   srand(1);
+  showLoss = 1.0;    // compensation exactly right: the honest worst case for noise
 
   printf("\n7-tile flower, clock skew + /-0.6%% rate error\n");
   lossPercent = 0;
@@ -407,17 +458,21 @@ int main() {
   build_flower();
   expect_within("cold start converges", 20);
 
-  printf("\n2 tiles, 1 mated edge each, +/-1%% oscillators\n");
+  printf("\n2 tiles, 1 mated edge each, 4%% apart oscillators\n");
   lossPercent = 0;
   build_pair();
   expect_within("pair converges", 10);
-  int dropped = worst_gap_ms();
+  int dropped, spread;
+  soak_pair(60, &dropped, &spread);
   printf("  ....  link %d/%d delivered (%.0f%% lost to self-deafness)\n",
          pktDelivered, pktSent,
          pktSent ? 100.0 * pktLostDeaf / pktSent : 0.0);
   printf("  %s  follower held the root for %d ms over 60 s\n",
          dropped ? "!!  " : "PASS", dropped);
+  printf("  %s  clock spread over 60 s: %d ms\n",
+         spread > MAX_CLOCK_SPREAD_MS ? "FAIL" : "PASS", spread);
   if (dropped) failures++;
+  if (spread > MAX_CLOCK_SPREAD_MS) failures++;
 
   printf("\n%s\n\n", failures ? "FAILED" : "all checks passed");
   return failures ? 1 : 0;

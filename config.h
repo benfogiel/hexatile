@@ -67,6 +67,12 @@
 // a tile being attached, so they back off to discovery duty.
 #define IDLE_BEACON_MS     1600
 
+// Fast beacons a side keeps sending after its neighbor disappears, before it
+// accepts the loss and drops to the idle rate. Backing off immediately makes a
+// dropped link self-sustaining: the side goes quiet exactly when it needs to
+// re-acquire, so the outage lasts seconds rather than one beacon.
+#define LINK_GRACE_BEACONS 25
+
 // Side considered vacated after this. It has to cover a burst of loss, not just
 // one packet: at BEACON_MS this is the number of consecutive misses that will
 // drop a live neighbor and send the tile back to believing it is a root.
@@ -99,7 +105,7 @@
 #define DBG_TOPOLOGY   3   // direct readout of what each tile believes
 #define DBG_RINGS      4   // end-to-end: rings expanding from the root tile
 
-#define DEBUG_PATTERN  DBG_TOPOLOGY
+#define DEBUG_PATTERN  DBG_OFF
 
 // ============================================================================
 // Shared types

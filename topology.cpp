@@ -29,11 +29,6 @@ static int8_t   lastSyncSide;
 static int8_t   gx[NUM_LEDS], gy[NUM_LEDS];   // rotated local LED coords, mm
 static uint16_t lastUpdate;
 
-// Max clock correction per beacon. One beacon per ~400 ms gives 2% of authority
-// over the parent's rate — ample once the blackout compensation is in, and slow
-// enough that the correction is never visible.
-#define SLEW_MS 8
-
 uint16_t topo_anim_time() { return (uint16_t)millis() + animOffset; }
 
 // Time the caller spent with interrupts off, which millis() therefore missed.
@@ -237,10 +232,19 @@ void topo_update() {
       syncCount++;
       syncErr = err;
 #endif
-      if (err > 800 || err < -800)   animOffset += (uint16_t)err;   // jump
-      else if (err > SLEW_MS)        animOffset += SLEW_MS;
-      else if (err < -(int16_t)SLEW_MS) animOffset -= SLEW_MS;
-      else                           animOffset += (uint16_t)err;
+      // Take the whole error, every time. animOffset is the only handle this
+      // design has on the clock — nothing anywhere adjusts its *rate* — so a
+      // capped correction is not a gentler version of the same thing, it is a
+      // ceiling on how fast a parent's oscillator may run before the child can
+      // never catch it again. A cap of 8 ms at ~2.3 beacons/s put that ceiling
+      // at 1.9%, which two untrimmed RC oscillators clear easily; past it the
+      // error ramped until it tripped a jump, forever.
+      //
+      // Correcting fully leaves only the drift accumulated between beacons
+      // (rate error x ~430 ms, so ~13 ms at 3%) plus a few ms of measurement
+      // noise — under a frame either way, and no worse for being applied at
+      // once, since a jump this small is invisible in any of the effects.
+      animOffset += (uint16_t)err;
     }
   }
 }

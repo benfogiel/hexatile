@@ -56,11 +56,16 @@ its own 91 LEDs locally. The single-wire links only carry tiny, infrequent
   * `my_pos = (q,r) + step[(rot + s_p) mod 6]`
   One packet fully places a tile. Move a tile → old side times out (1.5 s),
   new side hears a beacon, map heals, animation re-flows.
-* **Clock:** children slew toward `parent_t + airtime + elapsed`, at most 8 ms
-  per *beacon* (not per update — folding the same measurement in at 20 Hz
-  would both over-correct and bake in the staleness bias of an old packet).
-  Large errors jump instead. Root free-runs and advances the animation index on
-  a counter every `ANIM_PERIOD_MS`.
+* **Clock:** children take the *whole* error toward `parent_t + airtime +
+  elapsed`, once per *beacon* (not per update — folding the same measurement in
+  at 20 Hz would both over-correct and bake in the staleness bias of an old
+  packet). `animOffset` is the only handle on the clock; nothing adjusts its
+  rate. So a capped correction is not a gentler version of the same thing, it is
+  a ceiling on how fast a parent's oscillator may run before the child can never
+  catch up — the old 8 ms cap put that at 1.9%, and past it the error ramped to
+  800 ms, jumped, and repeated forever. Correcting fully leaves only the drift
+  between beacons (~13 ms at 3%), which is invisible. Root free-runs and
+  advances the animation index on a counter every `ANIM_PERIOD_MS`.
 * **Interrupt discipline:** bit-banging blocks for ~1.1 ms a byte and ~13 ms a
   packet. Doing that with `cli()` starves `millis()` in proportion to link
   traffic — a 6-neighbour tile loses ~40% of wall time, a corner tile ~6% —
@@ -126,6 +131,13 @@ delivery rates. A two-tile scenario reports what fraction of the single link
 survives, and fails if the follower ever falls back to believing it is a root —
 which at `IDLE_BEACON_MS 400` / `NEIGHBOR_TIMEOUT_MS 1500` it did for 2150 ms
 out of every 60 s, matching what the hardware showed.
+
+That pair is then soaked for a minute with its oscillators 4% apart, because
+convergence is scored the instant it first passes and a sync loop that cannot
+hold its parent still looks perfect one second in. Warm-up is excluded so the
+cold-start jump is not mistaken for steady state. Against the 8 ms slew cap this
+soak reports 808 ms of clock spread; correcting fully it reports 38 ms, and that
+residual is set by gaps in the link rather than by the loop.
 
 Covered: cold start, root unplugged mid-ring, a tile moved to a new cell and
 rotation, 20% packet loss, and a two-tile pair with ±1% oscillators. The root-removal case is the one that motivated

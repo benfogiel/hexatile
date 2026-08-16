@@ -39,6 +39,7 @@ static volatile RxState  rxs[NUM_SIDES];
 static Neighbor          nbr[NUM_SIDES];      // ISR-owned; main loop touches it
                                               // only inside an ATOMIC_BLOCK
 static uint16_t          nextBeacon[NUM_SIDES];
+static uint8_t           linkGrace[NUM_SIDES];   // fast beacons still owed after a loss
 static uint8_t           gID;
 static uint8_t           sideMaskA, sideMaskB;
 
@@ -238,6 +239,7 @@ void comms_init(uint8_t myID) {
     else                         sideMaskB |= SIDES[s].mask;
     rxs[s].idx = 0;
     nbr[s].present = false;
+    linkGrace[s] = LINK_GRACE_BEACONS;   // beacon fast at power-up so mates find each other
     nextBeacon[s] = (uint16_t)millis() + (uint16_t)s * (BEACON_MS / NUM_SIDES)
                     + (myID & 0x1F);
   }
@@ -258,6 +260,13 @@ void comms_poll() {
       present = nbr[s].present;
     }
 
+    // A side that is up keeps its grace topped up, so losing a neighbor leaves
+    // a run of fast beacons behind it rather than dropping straight to the idle
+    // rate. Backing off the instant a link fails is a trap: the side goes quiet
+    // exactly when it most needs to talk, so re-acquiring takes seconds instead
+    // of one beacon, and the gap is long enough to drop the neighbor again.
+    if (present) linkGrace[s] = LINK_GRACE_BEACONS;
+
     // Beacon when due, with ID/side-dependent jitter to break collision lockstep.
     // A side with nothing on it backs off: sending masks every side's interrupt
     // for the whole packet, so beaconing into an open edge buys nothing and
@@ -266,8 +275,14 @@ void comms_poll() {
     // itself, and it lands squarely on the only link there is.
     if ((int16_t)(now - nextBeacon[s]) >= 0) {
       send_beacon(s);
-      nextBeacon[s] = now + (present ? BEACON_MS : IDLE_BEACON_MS)
-                    + ((gID * 13u + s * 29u + now) & 0x3F);
+      uint16_t interval = IDLE_BEACON_MS;
+      if (present) {
+        interval = BEACON_MS;
+      } else if (linkGrace[s]) {
+        interval = BEACON_MS;
+        linkGrace[s]--;
+      }
+      nextBeacon[s] = now + interval + ((gID * 13u + s * 29u + now) & 0x3F);
     }
   }
 }
