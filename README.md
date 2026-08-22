@@ -23,13 +23,13 @@ its own 91 LEDs locally. The single-wire links only carry tiny, infrequent
 | `anim.cpp/.h` | fixed-point effects (rainbow rings, sweep, plasma), bring-up patterns, HSV→RGB, brightness cap |
 | `sim/` | host-side regression test for the topology layer (see below) |
 
-## Protocol (12-byte beacon, ~13 ms airtime)
+## Protocol (11-byte beacon, ~12 ms airtime)
 
-`[A5][ver][rootID][q][r][rot<<3|txSide][hop][age][t_lo][t_hi][animID][crc8]`
+`[A5][ver][rootID][q][r][rot<<3|txSide][hop][age][t_lo][t_hi][crc8]`
 
 * A side with a neighbor beacons every ~400 ms (jittered); an open side backs
   off to `IDLE_BEACON_MS`. Transmitting masks *every* side's interrupt for the
-  whole 13 ms packet, so a beacon into an open edge is 13 ms of deafness on the
+  whole 12 ms packet, so a beacon into an open edge is 12 ms of deafness on the
   edges that are mated, bought for nothing. On two tiles that was five sixths of
   all self-inflicted deafness, landing on the only link in the assembly: 32% of
   it lost, enough to time out a live neighbor and send the follower back to
@@ -59,14 +59,33 @@ its own 91 LEDs locally. The single-wire links only carry tiny, infrequent
 * **Clock:** children take the *whole* error toward `parent_t + airtime +
   elapsed`, once per *beacon* (not per update — folding the same measurement in
   at 20 Hz would both over-correct and bake in the staleness bias of an old
-  packet). `animOffset` is the only handle on the clock; nothing adjusts its
+  packet). Where the clock sits is the only handle on it; nothing adjusts its
   rate. So a capped correction is not a gentler version of the same thing, it is
   a ceiling on how fast a parent's oscillator may run before the child can never
   catch up — the old 8 ms cap put that at 1.9%, and past it the error ramped to
   800 ms, jumped, and repeated forever. Correcting fully leaves only the drift
-  between beacons (~13 ms at 3%), which is invisible. Root free-runs and
-  advances the animation index on a counter every `ANIM_PERIOD_MS`.
-* **Interrupt discipline:** bit-banging blocks for ~1.1 ms a byte and ~13 ms a
+  between beacons (~13 ms at 3%), which is invisible. The root free-runs; every
+  other tile steers onto its parent.
+* **Which animation is showing is not state, it is a clock reading.** The shared
+  clock counts one full pass through the list — `ANIM_CYCLE_MS`, i.e.
+  `NUM_ANIMS * ANIM_PERIOD_MS`, 92.16 s — and wraps there, so
+  `anim = clock / ANIM_PERIOD_TICKS` on every tile and the list still restarts
+  at 0 after a wrap. An index carried in the beacon instead *looked* synced but
+  changed one beacon later per hop from the root, and stalled wherever a packet
+  was lost, because a tile re-reads the animation index of whatever beacon it
+  last received — which the age limit lets it hold for up to 5 s. Measured on
+  the 7-tile flower at 20% loss, the assembly showed two animations at once for
+  3.8 s per changeover; off the clock it is 24 ms.
+* **The clock counts 4 ms ticks, not milliseconds.** What has to fit its 16 bits
+  is the whole cycle, and at 1 ms a count that caps out at 65 s — three 30 s
+  animations do not fit. 4 ms is a third of the ~13 ms the clock drifts between
+  beacons, so it is not the quantisation that limits how closely tiles agree.
+  `topo_anim_time()` hands the effects milliseconds, wrapping at 65536 partway
+  through the cycle; every effect's period divides that, so unlike the cycle's
+  own wrap it does not show. The dwell is 30720 ms rather than a round 30000
+  because 92160 = 90 × 1024 and 92160 − 65536 = 26 × 1024, which keeps
+  `DBG_SYNC`'s 1.024 s ramp seamless across both wraps.
+* **Interrupt discipline:** bit-banging blocks for ~1.1 ms a byte and ~12 ms a
   packet. Doing that with `cli()` starves `millis()` in proportion to link
   traffic — a 6-neighbour tile loses ~40% of wall time, a corner tile ~6% —
   which is a rate spread no slew can chase. So comms masks *only the six side
@@ -136,11 +155,29 @@ That pair is then soaked for a minute with its oscillators 4% apart, because
 convergence is scored the instant it first passes and a sync loop that cannot
 hold its parent still looks perfect one second in. Warm-up is excluded so the
 cold-start jump is not mistaken for steady state. Against the 8 ms slew cap this
-soak reports 808 ms of clock spread; correcting fully it reports 38 ms, and that
-residual is set by gaps in the link rather than by the loop.
+soak reports 808 ms of clock spread; correcting fully it reports 64 ms, and that
+residual is set by gaps in the link rather than by the loop — two or three
+beacons lost to self-deafness on the only link there is, at 4% relative rate.
+That is over the 60 ms the test asserts, and has been since `IDLE_BEACON_MS` and
+`NEIGHBOR_TIMEOUT_MS` were retuned; it is a two-tile bench worst case, not what
+an assembly with more links to sync against sees.
+
+`millis()` is modelled as never running backwards. `strip.show()` stalls the
+timer, it does not rewind it, but the LED blackout lands in the model as one
+lump at the end of a frame, so the tile's clock is clamped monotonic. Letting it
+step back is not a harsher test, it is a different chip: it hands the firmware a
+negative elapsed time, which no amount of correctness downstream survives.
+
+A separate soak watches the whole flower across a changeover and times how long
+it spends showing two animations at once. This is what the beacon-carried
+animation index failed: 3.8 s at 20% loss, against 24 ms for the same assembly
+reading the index off the shared clock. The soak runs past a full cycle, so it
+covers the 2 → 0 changeover where the millisecond clock the effects see is also
+discontinuous.
 
 Covered: cold start, root unplugged mid-ring, a tile moved to a new cell and
-rotation, 20% packet loss, and a two-tile pair with ±1% oscillators. The root-removal case is the one that motivated
+rotation, 20% packet loss, a two-tile pair with ±1% oscillators, and animation
+changeover. The root-removal case is the one that motivated
 the age byte in the beacon: against the pre-aging code it never recovers at
 all, and the test does fail there, so it is not scoring vacuously.
 
@@ -151,7 +188,7 @@ all still need a scope and real tiles.
 ## Bring-up patterns (`DEBUG_PATTERN` in config.h)
 
 Set `DEBUG_PATTERN` to one of these, reflash every tile, and the normal
-animation cycle is replaced by a diagnostic (`animID` is ignored; the unused
+animation cycle is replaced by a diagnostic (the animation index is ignored; the unused
 effects and accessors compile out). A single pattern cannot tell you whether a
 fault is in the clock or in the map, so the first two hold one of those constant
 and leave the other as the only variable. Work down the list — each one assumes

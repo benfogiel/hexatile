@@ -107,13 +107,14 @@ static void render_topology(uint8_t* grbBuf) {
   // when behind and anticlockwise when ahead, red past 16 ms.
   if (!root) {
     int16_t err = topo_clock_err();
-    uint16_t mag = (uint16_t)(err < 0 ? -err : err);
-    uint8_t arm = (uint8_t)(mag / 8 + 1);
+    uint16_t mag = (uint16_t)(err < 0 ? -err : err);   // in clock ticks
+    uint8_t arm = (uint8_t)(mag / (8 / CLOCK_TICK_MS) + 1);
     if (arm > 24) arm = 24;
     for (uint8_t k = 0; k < arm; k++) {
       int16_t j = (err >= 0) ? (int16_t)k : -(int16_t)k;
       put_rgb(grbBuf, (uint8_t)(ring_first(4) + ((j % 24) + 24) % 24),
-              mag <= 16 ? 0 : 255, mag <= 16 ? 255 : 0, 0);
+              mag <= 16 / CLOCK_TICK_MS ? 0 : 255,
+              mag <= 16 / CLOCK_TICK_MS ? 255 : 0, 0);
     }
   }
 
@@ -136,8 +137,9 @@ static void render_topology(uint8_t* grbBuf) {
 void anim_render(uint8_t* grbBuf) {
 #if DEBUG_PATTERN == DBG_SYNC
   // Position is never consulted, so anything on screen is the clock alone: the
-  // whole tile ramps over 1.024 s and drops. That period divides 65536 exactly,
-  // so the clock's 16-bit wrap is seamless.
+  // whole tile ramps over 1.024 s and drops. That period divides both the cycle
+  // (92160 = 90 * 1024) and its excess over the 16-bit millisecond wrap, so
+  // neither wrap shows.
   uint8_t v = (uint8_t)((topo_anim_time() & 1023U) >> 2);
   for (uint8_t i = 0; i < NUM_LEDS; i++) put_rgb(grbBuf, i, v, v, v);
 

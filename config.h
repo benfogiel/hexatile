@@ -48,8 +48,8 @@
 #define COMMS_BAUD         9600UL
 #define BEACON_MS          400
 
-// Transmitting masks every side's pin interrupt for the whole 13 ms packet, so
-// a beacon into an open edge is 13 ms of deafness on the edges that are mated —
+// Transmitting masks every side's pin interrupt for the whole 12 ms packet, so
+// a beacon into an open edge is 12 ms of deafness on the edges that are mated —
 // the largest source of loss on a small assembly, where most edges are open.
 // Open sides only need to beacon often enough to notice a tile being attached.
 #define IDLE_BEACON_MS     1600
@@ -65,9 +65,26 @@
 // back to believing it is a root.
 #define NEIGHBOR_TIMEOUT_MS 3000
 
-#define AIR_DELAY_MS       13       // airtime of one 12-byte packet
-#define ANIM_PERIOD_MS     20000U   // root's dwell per animation
+#define AIR_DELAY_MS       12       // airtime of one 11-byte packet
 #define NUM_ANIMS          3
+
+// The shared clock counts in CLOCK_TICK_MS units, not milliseconds. What has to
+// fit its 16 bits is ANIM_CYCLE_MS — one full pass through the animation list —
+// because which animation is showing is not a piece of state that propagates,
+// it is that clock divided by the dwell. A changeover is therefore exactly as
+// simultaneous as the clock, rather than one beacon later per hop from the root.
+// At 1 ms a count the cycle would cap out at 65 s, which three 30 s animations
+// do not fit; 4 ms is a third of the ~13 ms of drift between beacons, so
+// quantising to it is not what limits how closely the tiles agree.
+#define CLOCK_TICK_MS      4
+#define ANIM_PERIOD_MS     30720U   // dwell per animation
+#define ANIM_CYCLE_MS      ((uint32_t)NUM_ANIMS * ANIM_PERIOD_MS)
+#define ANIM_PERIOD_TICKS  ((uint16_t)(ANIM_PERIOD_MS / CLOCK_TICK_MS))
+#define ANIM_CYCLE_TICKS   ((uint16_t)(ANIM_CYCLE_MS / CLOCK_TICK_MS))
+
+// 92160 ms = 90 * 1024, and the cycle's excess over the 16-bit millisecond wrap
+// (92160 - 65536 = 26624) is 26 * 1024 as well, so DBG_SYNC's 1.024 s ramp
+// divides both the clock and the discontinuity at its wrap, and stays seamless.
 
 // Root-information aging — the spanning tree's loop breaker. Every beacon
 // carries how long ago the root generated the information it relays: the root
@@ -105,8 +122,7 @@ struct NodeInfo {
   uint8_t  side;     // which of the sender's sides this beacon left on
   uint8_t  hop;      // distance from root
   uint8_t  age;      // age of this root info, in ROOT_AGE_UNIT_MS units
-  uint16_t t;        // sender's animation clock (ms, wraps)
-  uint8_t  animID;
+  uint16_t t;        // sender's animation clock, in CLOCK_TICK_MS units
 };
 
 struct Neighbor {

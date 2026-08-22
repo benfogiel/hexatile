@@ -57,7 +57,8 @@ struct TileApi {
   void     (*update)();
   void     (*fill)(NodeInfo*, uint8_t);
   uint8_t  (*id)();
-  uint16_t (*clock)();
+  uint16_t (*clockTicks)();
+  uint8_t  (*anim)();
   void     (*compensate)(uint16_t);
   int16_t  (*tileX)();
   int16_t  (*tileY)();
@@ -65,7 +66,8 @@ struct TileApi {
   const int8_t* (*ledY)();
 };
 #define API(N) { N::topo_init, N::topo_update, N::topo_fill_beacon, \
-                 N::topo_my_id, N::topo_anim_time, N::topo_clock_compensate_us, \
+                 N::topo_my_id, N::topo_clock_ticks, N::topo_anim_id, \
+                 N::topo_clock_compensate_us, \
                  N::topo_tile_x, N::topo_tile_y, N::topo_led_gx, N::topo_led_gy }
 static const TileApi API_TBL[NTILE] = {
   API(T0), API(T1), API(T2), API(T3), API(T4), API(T5), API(T6)
@@ -102,12 +104,20 @@ static int      pktSent, pktLostDeaf, pktDelivered;
 // error.
 static double fps[NTILE];
 static double showLoss;
-static double frameAcc[NTILE];
-static double lostMs[NTILE];
+static double   frameAcc[NTILE];
+static double   lostMs[NTILE];
+static uint32_t lastNow[NTILE];
 
+// millis() never runs backwards on the chip: strip.show() stalls the timer, it
+// does not rewind it. lostMs lands in one lump at the end of a frame, so clamp
+// the result monotonic — the tile sees its clock flat for the blackout and then
+// resume, which is what the hardware does.
 static void enter(int t) {
-  g_tile   = t;
-  g_now_ms = skew[t] + (uint32_t)(trueMs * rate[t] - lostMs[t]);
+  g_tile = t;
+  uint32_t v = skew[t] + (uint32_t)(trueMs * rate[t] - lostMs[t]);
+  if (v < lastNow[t]) v = lastNow[t];
+  lastNow[t] = v;
+  g_now_ms = v;
 }
 
 static int find_tile(int q, int r) {
@@ -226,6 +236,18 @@ static void run_ms(uint32_t ms) {
 // ---------------------------------------------------------------------------
 #define MAX_CLOCK_SPREAD_MS 60
 
+// The shared clock is a position on a circle of ANIM_CYCLE_TICKS, so two
+// readings are compared the short way round it; the answer is in ms.
+static int clock_gap(uint16_t a, uint16_t b) {
+  uint16_t fwd = b >= a ? b - a : (uint16_t)(b + ANIM_CYCLE_TICKS - a);
+  uint16_t d = fwd <= ANIM_CYCLE_TICKS / 2 ? fwd : (uint16_t)(ANIM_CYCLE_TICKS - fwd);
+  return d * CLOCK_TICK_MS;
+}
+
+// A changeover is only as sharp as the clock the tiles derive it from, so the
+// budget is the clock spread itself plus a frame.
+#define MAX_ANIM_SPLIT_MS   (MAX_CLOCK_SPREAD_MS + 20)
+
 // Where the renderer may put an LED versus where it physically is, once the
 // whole assembly is put through its one shared transform. The budget covers
 // integer rounding only: the >>7 fixed-point rotation truncates, and 127/111
@@ -328,11 +350,11 @@ static bool converged(char* why, size_t whyLen) {
   int spread = 0;
   for (int a = 0; a < NTILE; a++) {
     if (!truth[a].present) continue;
-    enter(a); uint16_t ca = API_TBL[a].clock();
+    enter(a); uint16_t ca = API_TBL[a].clockTicks();
     for (int b = 0; b < NTILE; b++) {
       if (!truth[b].present) continue;
-      enter(b); uint16_t cb = API_TBL[b].clock();
-      int d = (int)(int16_t)(ca - cb); if (d < 0) d = -d;
+      enter(b); uint16_t cb = API_TBL[b].clockTicks();
+      int d = clock_gap(ca, cb);
       if (d > spread) spread = d;
     }
   }
@@ -373,7 +395,7 @@ static void build_flower() {
     rate[t] = 1.0 + (t - 3) * 0.002;          // +/-0.6% clock rate error
     skew[t] = (uint32_t)t * 9173u;            // different power-on instants
     fps[t]  = 70.0 + t;                       // slightly different render rates
-    frameAcc[t] = 0; lostMs[t] = 0; deafUntil[t] = 0;
+    frameAcc[t] = 0; lostMs[t] = 0; lastNow[t] = 0; deafUntil[t] = 0;
   }
   for (int t = 0; t < NTILE; t++) set_id(t, IDS[t]);
 }
@@ -390,7 +412,7 @@ static void build_pair() {
   pktSent = pktLostDeaf = pktDelivered = 0;
   for (int t = 0; t < NTILE; t++) {
     rate[t] = 1.0; skew[t] = 0; deafUntil[t] = 0;
-    fps[t] = 70.0; frameAcc[t] = 0; lostMs[t] = 0;
+    fps[t] = 70.0; frameAcc[t] = 0; lostMs[t] = 0; lastNow[t] = 0;
   }
   rate[0] = 0.98; rate[1] = 1.02;
   fps[0] = 72.0; fps[1] = 66.0;    // the two tiles do not render in lockstep
@@ -416,15 +438,36 @@ static void soak_pair(int seconds, int* worstGapMs, int* worstSpreadMs) {
     if (v.hop == 0) { if (++gap > *worstGapMs) *worstGapMs = gap; }
     else gap = 0;
 
-    enter(0); uint16_t c0 = API_TBL[0].clock();
-    enter(1); uint16_t c1 = API_TBL[1].clock();
-    int d = (int)(int16_t)(c0 - c1);
-    if (d < 0) d = -d;
+    enter(0); uint16_t c0 = API_TBL[0].clockTicks();
+    enter(1); uint16_t c1 = API_TBL[1].clockTicks();
+    int d = clock_gap(c0, c1);
     if (d > *worstSpreadMs) *worstSpreadMs = d;
   }
 }
 
+// Clock spread is only half of "in sync": the tiles also have to change
+// animation together. Watch the whole flower across a changeover and time how
+// long it spends showing two different animations at once.
+static void soak_anim(int seconds, int* worstSplitMs) {
+  int split = 0;
+  *worstSplitMs = 0;
+  for (int k = 0; k < seconds * 1000; k++) {
+    run_ms(1);
+    uint8_t first = 0;
+    bool have = false, agree = true;
+    for (int t = 0; t < NTILE; t++) {
+      if (!truth[t].present) continue;
+      enter(t);
+      uint8_t a = API_TBL[t].anim();
+      if (!have) { first = a; have = true; }
+      else if (a != first) agree = false;
+    }
+    if (agree) split = 0;
+    else if (++split > *worstSplitMs) *worstSplitMs = split;
+  }
+}
 
+// ---------------------------------------------------------------------------
 int main() {
   srand(1);
   showLoss = 1.0;    // compensation exactly right: the honest case for noise
@@ -465,6 +508,21 @@ int main() {
          spread > MAX_CLOCK_SPREAD_MS ? "FAIL" : "PASS", spread);
   if (dropped) failures++;
   if (spread > MAX_CLOCK_SPREAD_MS) failures++;
+
+  // The old design carried the animation index in the beacon, so a changeover
+  // walked out from the root one beacon per hop and stalled wherever a packet
+  // was lost — seconds of the assembly showing two animations at once. Deriving
+  // it from the shared clock instead makes loss irrelevant to it, so this runs
+  // at the harsher loss rate.
+  printf("\n7-tile flower, animation changeover under 20%% loss\n");
+  lossPercent = 20;
+  build_flower();
+  expect_within("cold start converges", 10);
+  int split;
+  soak_anim(100, &split);
+  printf("  %s  split across two animations for %d ms\n",
+         split > MAX_ANIM_SPLIT_MS ? "FAIL" : "PASS", split);
+  if (split > MAX_ANIM_SPLIT_MS) failures++;
 
   printf("\n%s\n\n", failures ? "FAILED" : "all checks passed");
   return failures ? 1 : 0;

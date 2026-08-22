@@ -5,11 +5,11 @@
 
 #define BIT_US   (1000000UL / COMMS_BAUD)   // 104 us at 9600
 #define PKT_SYNC 0xA5
-#define PKT_VER  0x02
+#define PKT_VER  0x03
 
 enum PacketOffset {
   OFF_SYNC, OFF_VER, OFF_ROOT, OFF_Q, OFF_R, OFF_ROT_SIDE,
-  OFF_HOP, OFF_AGE, OFF_T_LO, OFF_T_HI, OFF_ANIM, OFF_CRC,
+  OFF_HOP, OFF_AGE, OFF_T_LO, OFF_T_HI, OFF_CRC,
   PKT_LEN
 };
 #define CRC_COVERED (OFF_CRC - OFF_VER)
@@ -48,7 +48,7 @@ static uint8_t           sideMaskA, sideMaskB;
 
 // ---------------------------------------------------------------------------
 // Side-pin interrupt gating. Bit-banging a byte takes ~1.1 ms and a packet
-// ~13 ms; blocking *every* interrupt for that long starves millis(), and by an
+// ~12 ms; blocking *every* interrupt for that long starves millis(), and by an
 // amount that scales with link traffic (~40% of wall time on a 6-neighbour
 // tile, ~6% on a corner one). That spread is far beyond what the sync loop can
 // chase, so mask only the six side pins: no other link can preempt the bits we
@@ -100,7 +100,6 @@ static void rx_packet_done(uint8_t s) {
   n.info.hop    = r.buf[OFF_HOP];
   n.info.age    = r.buf[OFF_AGE];
   n.info.t      = (uint16_t)r.buf[OFF_T_LO] | ((uint16_t)r.buf[OFF_T_HI] << 8);
-  n.info.animID = r.buf[OFF_ANIM];
   n.lastHeard   = (uint16_t)millis();
   n.present     = true;
 }
@@ -223,7 +222,6 @@ static void send_beacon(uint8_t s) {
   p[OFF_AGE]      = me.age;
   p[OFF_T_LO]     = (uint8_t)(me.t & 0xFF);
   p[OFF_T_HI]     = (uint8_t)(me.t >> 8);
-  p[OFF_ANIM]     = me.animID;
   p[OFF_CRC]      = crc8(&p[OFF_VER], CRC_COVERED);
   tx_packet(s, p);
 }
